@@ -1,0 +1,19 @@
+# ── DeltaQuant — Docker Compose (stub) ───────────────────────────────────────
+# Fully implemented in Phase 5 (chore/f5-docker-compose-bot-redis).
+# This stub keeps the directory structure consistent with §4 of the tech plan.
+
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    env_file: .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Redis is control-plane only — never in the evaluation hot path.
+    # See ADR-002 (docs/adr/) for the rationale.
