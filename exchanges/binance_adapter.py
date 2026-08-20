@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from functools import lru_cache
 from typing import AsyncIterator
 
 import ccxt
@@ -142,6 +141,12 @@ class BinanceAdapter(ExchangeAdapter):
             symbol, populated lazily on first request.  Fee tiers change
             rarely, so this avoids repeated REST round-trips during the
             periodic volume-refresh cycle.
+        _markets_cache: In-process cache of the full market metadata dict
+            loaded from Binance.  Populated lazily on the first call to
+            ``get_markets()``.  Stored as instance state rather than
+            ``lru_cache`` so that multiple adapter instances (tests, future
+            multi-exchange setups) maintain independent caches and don't
+            evict each other's entries.
     """
 
     def __init__(self, client: ccxt.binance, settings: Settings) -> None:
@@ -156,6 +161,7 @@ class BinanceAdapter(ExchangeAdapter):
         self._client: ccxt.binance = client
         self._settings: Settings = settings
         self._fee_cache: dict[str, TradingFees] = {}
+        self._markets_cache: dict | None = None
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -380,14 +386,20 @@ class BinanceAdapter(ExchangeAdapter):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    @lru_cache(maxsize=1)
     def _load_markets(self) -> dict:
         """Load and cache the full market metadata from Binance.
 
         Calls ``ccxt.binance.load_markets()`` which returns a dict of all
         trading pairs with their filters (lot size, tick size, min notional,
-        etc.).  The result is cached via ``lru_cache`` because it rarely
-        changes and the call costs one REST round-trip.
+        etc.).  The result is cached in ``self._markets_cache`` because market
+        metadata rarely changes and the call costs one REST round-trip.
+
+        Lazy caching pattern: the first call fetches from the exchange and
+        stores the result; subsequent calls return the cached value directly.
+        Using an instance attribute rather than ``@lru_cache`` ensures each
+        adapter instance maintains its own independent cache, preventing
+        cross-instance eviction when multiple adapters coexist (e.g. in tests
+        or future multi-exchange setups).
 
         This is a synchronous helper intended to be called inside
         ``run_in_executor`` by async callers.
@@ -396,7 +408,9 @@ class BinanceAdapter(ExchangeAdapter):
             Dict of ccxt market objects keyed by unified symbol
             (e.g. ``"BTC/USDT"``).
         """
-        return self._client.load_markets()
+        if self._markets_cache is None:
+            self._markets_cache = self._client.load_markets()
+        return self._markets_cache
 
     async def get_markets(self) -> dict:
         """Return all spot markets loaded from Binance, with caching.
