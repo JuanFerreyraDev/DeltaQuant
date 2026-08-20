@@ -178,14 +178,19 @@ Per the technical plan §8, Fase 2 scope:
 
 ## Open questions / deferred decisions
 
-- **Non-USDT triangle legs**: Phase 1 generates only triangles whose pairs
-  are discoverable from the USDT-quoted filtered set.  Pairs like `ETH/BTC`
-  are included only when *both* `ETH/USDT` and `BTC/USDT` also pass the
-  volume filter.  If the volume filter is very tight, some valid triangles
-  will be excluded because a USDT leg doesn't meet the threshold even though
-  the cross pair has sufficient liquidity.  A more sophisticated filter
-  (include a cross pair if both its constituent USDT pairs pass) is a
-  candidate for Phase 2 once real pair data has been observed.
+- **Non-USDT triangle legs**: Phase 1 now accepts cross pairs (like `ETH/BTC`)
+  in the volume filter. For non-USDT-quoted pairs, `baseVolume` is compared
+  directly against the USDT-denominated threshold (Phase 1 simplification to
+  avoid a price-lookup loop). The consequence: a cross pair passes the filter
+  if its base-asset volume is high, which is a reasonable proxy for liquidity
+  but not a strict USDT-equivalent measure. True volume conversion (cross pair
+  quantified in USDT using the quote asset's price) is deferred to Phase 2
+  once real pair data has been observed and the overhead is justified.
+
+  **USDT constraint** (now enforced): All triangles returned by
+  `generate_triangles` must include USDT as one of the three assets. This
+  reflects the bot's dependency on USDT as its held capital: a triangle with
+  no USDT leg (e.g. BTC-ETH-BNB) cannot be entered or exited.
 
 - **Leveraged token filtering**: the volume filter currently passes pairs like
   `BTC3LUSDT` if their volume exceeds the threshold.  These are not suitable

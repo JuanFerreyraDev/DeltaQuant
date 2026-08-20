@@ -120,40 +120,37 @@ def parse_symbol(symbol: str) -> tuple[str, str] | None:
             return parts[0].upper(), parts[1].upper()
         return None
     # Native Binance format — no delimiter.  We can only reliably split these
-    # for USDT-quoted pairs in Phase 1 (USDT is always the suffix).
+    # for USDT-quoted pairs and known non-USDT pairs (e.g. "ETHBTC").
+    # In Phase 1, we only parse USDT-quoted pairs from native format;
+    # non-USDT pairs must arrive in slash-delimited unified format from ccxt.
     if symbol.endswith("USDT") and len(symbol) > 4:
         return symbol[:-4].upper(), "USDT"
     return None
 
 
-def filter_pairs_by_volume(
-    raw_tickers: list[dict],
-    min_volume_usdt: Decimal,
-) -> list[TradingPair]:
-    """Filter ccxt ticker dicts to tradeable pairs above the volume threshold.
+def _build_quote_asset_prices(raw_tickers: list[dict]) -> dict[str, Decimal]:
+    """Build a map of quote asset → its price in USDT from USDT-quoted tickers.
 
-    Iterates over the raw ticker list returned by ``BinanceAdapter.fetch_tickers_24h()``,
-    keeps only USDT-quoted spot pairs, and discards any pair whose 24-hour
-    quote-asset volume is strictly below ``min_volume_usdt``.
+    Scans the raw ticker list for all USDT-quoted pairs. For each such pair,
+    extracts the base asset ticker and its current price (from the ``last``
+    field, the most recent trade price available in the ticker). This map is
+    used to compute USDT-equivalent volumes for non-USDT-quoted pairs.
 
-    The function is intentionally permissive about missing fields: if a ticker
-    dict lacks ``quoteVolume`` it is treated as zero volume and filtered out,
-    rather than raising an exception.  This makes the function robust to
-    unexpected exchange responses without masking real errors.
+    **Price field choice**: ``last`` (most recent trade price) is used instead of
+    ``close`` (24h close) because it reflects current market price at the time
+    tickers were fetched, and is consistent with how ccxt.binance exposes
+    real-time pricing. For a stable USDT price lookup, any trade price within
+    the 24h window is sufficient (USDT is a stablecoin).
 
     Args:
-        raw_tickers: List of ccxt ticker dicts.  Each dict is expected to have
-            at minimum ``"symbol"`` (unified, e.g. ``"BTC/USDT"``) and
-            ``"quoteVolume"`` (float or string).  Extra keys are ignored.
-        min_volume_usdt: Minimum 24-hour USDT volume (inclusive lower bound is
-            NOT used — pairs must be *strictly above* this threshold).
+        raw_tickers: List of ccxt ticker dicts from ``fetch_tickers``.
 
     Returns:
-        List of ``TradingPair`` objects for pairs that passed the filter,
-        sorted by ``volume_usdt`` descending so the highest-liquidity pairs
-        appear first.  Returns an empty list if no pair passes.
+        Dict mapping asset ticker (e.g. ``"BTC"``, ``"ETH"``) to its current
+        USDT price as ``Decimal``. Assets without an associated USDT ticker
+        in the batch are absent from the map.
     """
-    result: list[TradingPair] = []
+    prices: dict[str, Decimal] = {}
 
     for ticker in raw_tickers:
         raw_symbol: str = ticker.get("symbol", "")
@@ -165,11 +162,116 @@ def filter_pairs_by_volume(
         if quote != "USDT":
             continue
 
-        raw_vol = ticker.get("quoteVolume")
+        # Extract price from the ``last`` field (most recent trade price).
+        # This is the price used for volume conversion of non-USDT pairs.
+        last_price = ticker.get("last")
+        if last_price is None:
+            continue
+
+        try:
+            prices[base] = Decimal(str(last_price))
+        except Exception:
+            # If conversion fails, skip this price entry.
+            continue
+
+    return prices
+
+
+def filter_pairs_by_volume(
+    raw_tickers: list[dict],
+    min_volume_usdt: Decimal,
+) -> list[TradingPair]:
+    """Filter ccxt ticker dicts to tradeable pairs above the volume threshold.
+
+    Iterates over the raw ticker list returned by ``BinanceAdapter.fetch_tickers_24h()``,
+    filters by 24-hour volume, and discards any pair whose volume is strictly
+    below ``min_volume_usdt``.
+
+    **Volume comparison for USDT-quoted vs. cross pairs:**
+
+    - For USDT-quoted pairs (e.g. ``BTC/USDT``): compares ``quoteVolume``
+      (24h volume already denominated in USDT) directly against the threshold.
+
+    - For non-USDT pairs (e.g. ``ETH/BTC``): computes USDT-equivalent volume as:
+
+        ``quoteVolume × price_of_quote_asset_in_USDT``
+
+      The quote asset's USDT price is sourced from a USDT-quoted pair
+      (``quote_asset/USDT``) in the same raw_tickers batch. If no such pair
+      exists (e.g. an exotic quote asset with no direct USDT listing), the
+      pair is excluded — we do not fall back to unconverted fallbacks or
+      heuristics.
+
+    This approach is cleaner than using baseVolume because:
+    - quoteVolume is already in a single denomination (the quote asset), so one
+      price lookup converts to USDT.
+    - baseVolume would require the base asset's USDT price for a full conversion,
+      an unnecessary second lookup.
+
+    The function is intentionally permissive about missing/malformed data for
+    USDT pairs (treated as zero volume, not an error). For non-USDT pairs, it
+    requires both a price lookup and a quoteVolume value; missing either results
+    in the pair being excluded (not an error).
+
+    Args:
+        raw_tickers: List of ccxt ticker dicts from ``fetch_tickers_24h()``.
+            Each dict is expected to have at minimum ``"symbol"`` (unified,
+            e.g. ``"BTC/USDT"``) and ``"quoteVolume"`` (float or string).
+            Non-USDT pairs must also have a ``"last"`` field (recent trade
+            price). Extra keys are ignored.
+        min_volume_usdt: Minimum 24-hour USDT-equivalent volume threshold.
+            Pairs must be *strictly above* this threshold.
+
+    Returns:
+        List of ``TradingPair`` objects for pairs that passed the filter,
+        sorted by ``volume_usdt`` descending (highest liquidity first).
+        Returns an empty list if no pair passes.
+    """
+    # Build a map of asset → USDT price for all USDT-quoted pairs.
+    # This map is used to convert non-USDT volumes to USDT equivalents.
+    quote_asset_prices = _build_quote_asset_prices(raw_tickers)
+
+    result: list[TradingPair] = []
+
+    for ticker in raw_tickers:
+        raw_symbol: str = ticker.get("symbol", "")
+        parsed = parse_symbol(raw_symbol)
+        if parsed is None:
+            continue
+
+        base, quote = parsed
+
+        # Determine volume based on quote asset.
+        if quote == "USDT":
+            # USDT-quoted pair: volume is already in USDT.
+            raw_vol = ticker.get("quoteVolume")
+        else:
+            # Non-USDT pair: convert quoteVolume to USDT-equivalent.
+            raw_quote_vol = ticker.get("quoteVolume")
+            if raw_quote_vol is None:
+                continue
+
+            # Look up the quote asset's USDT price.
+            if quote not in quote_asset_prices:
+                # No price available for this quote asset → exclude the pair.
+                continue
+
+            quote_price_usdt = quote_asset_prices[quote]
+
+            try:
+                quote_volume_decimal = Decimal(str(raw_quote_vol))
+            except Exception:
+                continue
+
+            # Compute USDT-equivalent volume.
+            raw_vol = quote_volume_decimal * quote_price_usdt
+
         if raw_vol is None:
             continue
 
         try:
+            # Always convert via Decimal(str(...)) regardless of the input type.
+            # Technical plan §2 hard rule: no raw floats on monetary fields.
             volume = Decimal(str(raw_vol))
         except Exception:
             continue
@@ -177,8 +279,12 @@ def filter_pairs_by_volume(
         if volume <= min_volume_usdt:
             continue
 
-        # Derive the native symbol (no slash) for use as pair identifiers.
-        native_symbol = f"{base}USDT"
+        # Derive the native symbol: concatenated for USDT pairs (unambiguous),
+        # slash-delimited for cross pairs (unambiguous and parseable).
+        if quote == "USDT":
+            native_symbol = f"{base}{quote}"
+        else:
+            native_symbol = f"{base}/{quote}"
 
         result.append(
             TradingPair(
@@ -268,6 +374,12 @@ def generate_triangles(pairs: list[TradingPair]) -> list[Triangle]:
     An arbitrage triangle is a closed cycle of three assets ``A → B → C → A``
     where a tradeable pair exists for each of the three edges.
 
+    **USDT constraint**: All triangles returned must include USDT as one of the
+    three assets. This reflects the bot's operational constraint: capital is
+    held exclusively in USDT (technical plan §1), so a triangle with no USDT
+    leg (e.g. ``BTC-ETH-BNB``) cannot be executed — there is no way to enter
+    or exit the cycle without first converting to/from USDT.
+
     **Duplicate elimination**: two traversals of the same economic triangle
     (e.g. ``BTC→ETH→USDT`` and ``ETH→BTC→USDT``) are collapsed into a single
     ``Triangle`` by canonicalising the asset order (lexicographic sort) and
@@ -275,24 +387,27 @@ def generate_triangles(pairs: list[TradingPair]) -> list[Triangle]:
 
     Algorithm:
         1. Build a per-asset neighbour list from the pair index.
-        2. For every base asset ``A`` that appears in a USDT pair:
+        2. For every base asset ``A`` that appears in any pair:
              For every neighbour ``B`` of ``A`` (connected by any pair):
                For every neighbour ``C`` of ``B``:
                  If the edge ``C → A`` also exists:
-                   Attempt to build a canonical Triangle and add to result set.
+                   Attempt to build a canonical Triangle and add to result set
+                   (after checking the USDT constraint).
         3. The set guarantees no duplicates; convert to a sorted list for
            deterministic output.
 
     Args:
         pairs: Filtered list of ``TradingPair`` objects from
             ``filter_pairs_by_volume``.  May be empty, in which case an
-            empty list is returned immediately.
+            empty list is returned immediately.  May contain non-USDT pairs
+            (e.g. ``ETH/BTC``), which are now accepted by the volume filter.
 
     Returns:
-        List of unique ``Triangle`` objects.  Sorted by
-        ``(asset_a, asset_b, asset_c)`` for deterministic ordering.
+        List of unique ``Triangle`` objects where each triangle contains USDT.
+        Sorted by ``(asset_a, asset_b, asset_c)`` for deterministic ordering.
         Returns an empty list if fewer than three distinct assets exist in
-        ``pairs`` or if no complete triangle can be formed.
+        ``pairs``, if no complete triangle can be formed, or if all candidate
+        triangles violate the USDT constraint.
     """
     if len(pairs) < 3:
         return []
@@ -330,6 +445,11 @@ def generate_triangles(pairs: list[TradingPair]) -> list[Triangle]:
 
                 triangle = _canonical_triangle(a, b, c, pair_index)
                 if triangle is None:
+                    continue
+
+                # **USDT constraint**: at least one of the three assets must be USDT.
+                # The bot cannot trade in a cycle with no USDT leg (no entry/exit point).
+                if "USDT" not in (triangle.asset_a, triangle.asset_b, triangle.asset_c):
                     continue
 
                 seen.add(canonical_key)
