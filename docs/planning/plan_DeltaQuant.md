@@ -5,17 +5,17 @@
 Antes de la arquitectura, esto hay que decirlo explícitamente porque el objetivo declarado es **rentabilidad real desde el inicio**:
 
 En exchanges top-tier como Binance, el arbitraje triangular puro está dominado por market makers profesionales con:
-- Colocación física cerca del matching engine (latencia de microsegundos vs. los ~50-150ms que vas a tener desde un VPS en la nube pública).
+- Colocación física cerca del matching engine (latencia de microsegundos vs. los ~50-150ms que voy a tener desde un VPS en la nube pública).
 - Motores en C++/Rust, no Python (aunque con `asyncio`+`uvloop` bien hecho, Python puede ser "suficientemente rápido" para *algunas* oportunidades, no para todas).
-- Tarifas maker/taker mínimas (VIP9, tokens propios) que vos no vas a tener al principio.
+- Tarifas maker/taker mínimas (VIP9, tokens propios) que no voy a tener al principio.
 
 **Esto no significa que el proyecto no valga la pena o no pueda ser rentable**, pero condiciona decisiones de diseño:
 
-- **No vas a competir por las oportunidades de <0.05% de spread que cierran en 10ms.** Vas a competir por ineficiencias más lentas: mercados con volumen medio, momentos de alta volatilidad/noticias donde el book se desincroniza brevemente, o pares menos vigilados.
+- **No voy a competir por las oportunidades de <0.05% de spread que cierran en 10ms.** Voy a competir por ineficiencias más lentas: mercados con volumen medio, momentos de alta volatilidad/noticias donde el book se desincroniza brevemente, o pares menos vigilados.
 - La rentabilidad real depende tanto o más de la **gestión de comisiones** (BNB fee discount, VIP tier) y del **filtrado inteligente de oportunidades** que de la latencia pura.
-- El diseño multi-exchange futuro es valioso justamente por esto: monitorear varios CEX en simultáneo te da más superficie de oportunidades que pelear por latencia en uno solo.
+- El diseño multi-exchange futuro es valioso justamente por esto: monitorear varios CEX en simultáneo me da más superficie de oportunidades que pelear por latencia en uno solo.
 
-Con esto claro, el plan está diseñado para maximizar tus chances reales, no para prometer algo que la arquitectura no puede entregar.
+Con esto claro, el plan está diseñado para maximizar las chances reales, no para prometer algo que la arquitectura no puede entregar.
 
 ---
 
@@ -25,7 +25,7 @@ Bot de trading algorítmico que detecta y ejecuta arbitraje triangular intra-CEX
 
 ### Principios de diseño
 - **Sin riesgo de inventario planeado:** capital base en una sola moneda (USDT), órdenes FOK/IOC para las 3 patas. *Pero* con lógica explícita de reconciliación para el caso (raro pero real) en que una pata falle tras haberse ejecutado otra.
-- **Exchange-agnostic desde el día 1 a nivel de interfaz**, aunque la implementación inicial y el capital real solo operen en Binance. Esto evita una reescritura cuando agregues el segundo exchange.
+- **Exchange-agnostic desde el día 1 a nivel de interfaz**, aunque la implementación inicial y el capital real solo operen en Binance. Esto evita una reescritura cuando se agregue el segundo exchange.
 - **Optimización de comisiones como primera palanca de rentabilidad**, no una idea secundaria.
 - **Redis fuera del hot path.** Se usa para control-plane (kill switch, estado persistente entre reinicios) y telemetría, nunca en el ciclo de evaluación tick-a-tick, que vive 100% en memoria del proceso.
 
@@ -48,7 +48,7 @@ Bot de trading algorítmico que detecta y ejecuta arbitraje triangular intra-CEX
 | Monitoreo (nuevo) | `Prometheus` + `Grafana` (opcional, fase tardía) | Métricas de latencia y fill rate — más preciso que revisar logs de Telegram a mano |
 
 ### 3.1 Nota sobre `ccxt.pro`
-Es la elección correcta para arrancar por velocidad de desarrollo, pero agrega overhead de abstracción. Si en producción medís que la latencia de parseo de mensajes WS es un cuello de botella real (lo vas a saber por las métricas de §7), la salida es reemplazar el cliente WS de Binance por una integración directa con `websockets` + parseo manual del stream `bookTicker`, manteniendo el resto de la arquitectura intacta gracias a la capa de abstracción del §3.2.
+Es la elección correcta para arrancar por velocidad de desarrollo, pero agrega overhead de abstracción. Si en producción se detecta que la latencia de parseo de mensajes WS es un cuello de botella real (se va a saber por las métricas de §7), la salida es reemplazar el cliente WS de Binance por una integración directa con `websockets` + parseo manual del stream `bookTicker`, manteniendo el resto de la arquitectura intacta gracias a la capa de abstracción del §3.2.
 
 ### 3.2 Diseño para multi-exchange futuro
 Se define una interfaz `ExchangeAdapter` (ABC) con métodos async: `subscribe_book_ticker`, `place_fok_order`, `get_balance`, `get_trading_fees`. La implementación inicial `BinanceAdapter` es la única con capital real. Agregar un segundo exchange (ej. Bybit) más adelante significa escribir un nuevo adapter, no tocar `evaluator.py` ni `executor.py`. El grafo de triángulos y el motor de evaluación son agnósticos al origen de los precios.
@@ -110,12 +110,12 @@ DeltaQuant/
 │   ├── fases/
 │   ├── adr/
 │   └── runbooks/
-│   
+│
 ├── config/
 │   ├── settings.py             # Pydantic: credenciales, umbrales, límites de riesgo
 │   └── logging_config.py
 │
-├── exchanges/                   # NUEVO: capa de abstracción multi-exchange
+├── exchanges/                   # capa de abstracción multi-exchange
 │   ├── base.py                  # ABC ExchangeAdapter
 │   ├── binance_adapter.py       # Implementación real, único con capital vivo
 │   └── fees.py                  # Cálculo de comisiones por exchange/tier/descuento
@@ -124,7 +124,7 @@ DeltaQuant/
 │   ├── graph.py                 # Filtro por volumen + generación de triángulos
 │   ├── evaluator.py             # Evaluación matemática en RAM + staleness check
 │   ├── executor.py              # Despacho paralelo FOK/IOC
-│   └── risk.py                  # NUEVO: límites de capital, pérdida diaria, concurrencia
+│   └── risk.py                  # límites de capital, pérdida diaria, concurrencia
 │
 ├── interfaces/
 │   ├── telegram_bot.py          # /start, /kill, /resume, /status, /pnl
@@ -139,8 +139,8 @@ DeltaQuant/
 │   ├── test_evaluator.py
 │   ├── test_graph.py
 │   ├── test_executor.py
-│   ├── test_risk.py             # NUEVO
-│   └── test_reconciliation.py   # NUEVO: simula fallo de pata 2/3
+│   ├── test_risk.py
+│   └── test_reconciliation.py   # simula fallo de pata 2/3
 │
 ├── logs/
 ├── .env.example
@@ -158,7 +158,7 @@ DeltaQuant/
 Módulo explícito, no implícito en el flag `TRADING_ENABLED`:
 
 - **Tamaño máximo por operación**: % fijo o monto fijo del capital total configurable en `.env`.
-- **Límite de pérdida diaria**: si el PnL acumulado del día cae por debajo de un umbral, el bot se auto-pausa y alerta (no espera a que lo pares manualmente).
+- **Límite de pérdida diaria**: si el PnL acumulado del día cae por debajo de un umbral, el bot se auto-pausa y alerta (no espera a que se lo pare manualmente).
 - **Máximo de triángulos concurrentes**: evita sobreexposición si varias oportunidades disparan al mismo tiempo.
 - **Circuit breaker por incidentes de reconciliación**: si ocurren más de N liquidaciones de emergencia en una ventana de tiempo, el bot se pausa solo — es señal de que algo estructural está mal (latencia, símbolo problemático, bug).
 
@@ -188,9 +188,9 @@ Dado que el objetivo es rentabilidad desde el inicio, esto es tan importante com
 
 ## 8. Hoja de Ruta
 
-### Fase 0: Fundamentos de entorno (nueva — dado que no hay experiencia previa en VPS/Docker)
-- [ ] Instalar Docker Desktop localmente y correr el bot en modo `DRY_RUN` en tu propia PC primero — **no saltar directo al VPS**.
-- [ ] Familiarizarte con comandos básicos de Docker (`build`, `up`, `logs`, `exec`) sobre este mismo proyecto antes de tocar infraestructura remota.
+### Fase 0: Fundamentos de entorno
+- [ ] Instalar Docker Desktop localmente y correr el bot en modo `DRY_RUN` en la PC local primero — **no saltar directo al VPS**.
+- [ ] Familiarizarse con comandos básicos de Docker (`build`, `up`, `logs`, `exec`) sobre este mismo proyecto antes de tocar infraestructura remota.
 - [ ] Crear cuenta en un proveedor de VPS (recomendado para empezar: uno con datacenter en la misma región que el exchange — para Binance, considerar su región de infraestructura principal) y practicar acceso SSH básico con una instancia mínima, sin el bot todavía.
 
 ### Fase 1: Análisis de Mercado y Filtro de Triángulos
@@ -219,7 +219,7 @@ Dado que el objetivo es rentabilidad desde el inicio, esto es tan importante com
 - [ ] `Dockerfile` + `docker-compose.yml` (bot + Redis).
 - [ ] Contratar VPS Linux en región cercana a la infraestructura de Binance.
 - [ ] Guía paso a paso de hardening básico: usuario no-root, firewall (solo puertos necesarios), fail2ban, actualización de IP whitelisting en las API keys de Binance apuntando al VPS.
-- [ ] Deploy con `DRY_RUN=True` primero en el VPS real durante varios días — la latencia de red real cambia respecto a tu PC local, hay que remedir métricas ahí.
+- [ ] Deploy con `DRY_RUN=True` primero en el VPS real durante varios días — la latencia de red real cambia respecto a la PC local, hay que remedir métricas ahí.
 - [ ] Solo entonces, `DRY_RUN=False` con capital mínimo de prueba (definir monto explícito antes de arrancar, no "lo que sobre").
 
 ### Fase 6: Multi-exchange (futuro, post-validación en Binance)

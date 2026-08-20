@@ -1,17 +1,17 @@
 # Plan de Documentación: DeltaQuant (Bot de Arbitraje Triangular)
 
-Complementa a `plan_bot_arbitraje_triangular.md` y `roadmap_git_bot_arbitraje.md`.
+Complementa a `plan_DeltaQuant.md` y `roadmap_git_DQ.md`.
 
 ## Principio general: documentar en el momento de la decisión, no al final
 
 Documentar al final falla por dos razones concretas, no solo por pereza:
 
-1. **Se pierde el "por qué".** El código final muestra *qué* se hizo, pero para cuando llegás al final ya no recordás por qué descartaste la alternativa obvia (ej. por qué Redis quedó fuera del hot path, por qué las 3 patas se ejecutan en paralelo). Ese razonamiento es justamente lo más valioso de documentar en un sistema que toma decisiones automáticas con dinero real.
-2. **En este proyecto específico hay un requisito de auditoría, no solo de mantenibilidad.** Si en 3 meses el bot pierde dinero en un incidente de reconciliación, vas a necesitar reconstruir "qué límites de riesgo estaban activos, con qué lógica se calibró el margen de seguridad, qué asumía el código sobre la staleness del book" — y eso hay que capturarlo cuando se decide, no reconstruirlo bajo presión después de perder plata.
+1. **Se pierde el "por qué".** El código final muestra *qué* se hizo, pero para cuando se llega al final ya no se recuerda por qué se descartó la alternativa obvia (ej. por qué Redis quedó fuera del hot path, por qué las 3 patas se ejecutan en paralelo). Ese razonamiento es justamente lo más valioso de documentar en un sistema que toma decisiones automáticas con dinero real.
+2. **En este proyecto específico hay un requisito de auditoría, no solo de mantenibilidad.** Si en 3 meses el bot pierde dinero en un incidente de reconciliación, voy a necesitar reconstruir "qué límites de riesgo estaban activos, con qué lógica se calibró el margen de seguridad, qué asumía el código sobre la staleness del book" — y eso hay que capturarlo cuando se decide, no reconstruirlo bajo presión después de perder plata.
 
-Regla práctica: **si la documentación depende de una decisión que tomaste hoy, se escribe hoy.** Lo único que tiene sentido dejar para el final es documentación *de síntesis* (un README general, un diagrama consolidado) — nunca el registro de decisiones.
+Regla práctica: **si la documentación depende de una decisión que se tomó hoy, se escribe hoy.** Lo único que tiene sentido dejar para el final es documentación *de síntesis* (un README general, un diagrama consolidado) — nunca el registro de decisiones.
 
-> **Idioma:** toda la documentación del código (docstrings, ADRs, README, runbooks, registro de calibraciones) va **en inglés**, consistente con la convención de commits/PRs en inglés del roadmap de Git. Todos los ejemplos y plantillas de este documento ya están en inglés — solo las explicaciones dirigidas a vos quedan en español.
+> **Idioma:** toda la documentación del código (docstrings, ADRs, README, runbooks, registro de calibraciones) va **en inglés**, consistente con la convención de commits/PRs en inglés del roadmap de Git. Todos los ejemplos y plantillas de este documento ya están en inglés.
 
 ---
 
@@ -22,10 +22,10 @@ Regla práctica: **si la documentación depende de una decisión que tomaste hoy
 | **Docstrings** (funciones/clases) | En el mismo commit que el código | El propio archivo `.py` |
 | **ADR** (Architecture Decision Record) | En el momento de tomar la decisión, antes o junto con implementarla | `docs/adr/` |
 | **README por fase** | Al cerrar cada fase del roadmap (mismo momento del tag de Git) | `README.md` + `docs/fases/` |
-| **Runbook de incidentes** | Cuando definís el mecanismo (reconciliación, circuit breaker), no cuando ocurre el primer incidente real | `docs/runbooks/` |
-| **Registro de calibración de parámetros** | Cada vez que fijás o recalibrás un umbral (`safety_margin`, límites de `risk.py`) | `docs/calibrations.md` |
+| **Runbook de incidentes** | Cuando se define el mecanismo (reconciliación, circuit breaker), no cuando ocurre el primer incidente real | `docs/runbooks/` |
+| **Registro de calibración de parámetros** | Cada vez que se fija o recalibra un umbral (`safety_margin`, límites de `risk.py`) | `docs/calibrations.md` |
 | **README general / portfolio** | Al final del proyecto (o de cada release mayor) | `README.md` (raíz) |
-| **CHANGELOG** | Automático, por commit (ver roadmap de Git) | `CHANGELOG.md` |
+| **CHANGELOG** | Automático, por commit (ver `roadmap_git_DQ.md`) | `CHANGELOG.md` |
 
 ---
 
@@ -142,8 +142,8 @@ Tener esto escrito de antemano importa porque un incidente real a las 3am con di
 
 ## 6. README por fase vs. README general
 
-- **`docs/fases/faseN.md`**: se escribe al cerrar cada fase (mismo momento que el tag de Git). Resume qué se implementó, qué se validó en dry run, y qué quedó pendiente o se descartó. Es la versión "diario de proyecto", útil para vos mismo más que para terceros.
-- **`README.md` (raíz)**: se escribe/actualiza al final de cada release significativa (mínimo, al llegar a `v1.0.0-live`). Es la versión de síntesis — la que mostrarías si alguna vez este proyecto entra a un portfolio. Se arma resumiendo los README de fase, no escribiendo desde cero.
+- **`docs/fases/faseN.md`**: se escribe al cerrar cada fase (mismo momento que el tag de Git). Resume qué se implementó, qué se validó en dry run, y qué quedó pendiente o se descartó. Es la versión "diario de proyecto", útil para el propio dev más que para terceros.
+- **`README.md` (raíz)**: se escribe/actualiza al final de cada release significativa (mínimo, al llegar a `v1.0.0-live`). Es la versión de síntesis — la que se mostraría si alguna vez este proyecto entra a un portfolio. Se arma resumiendo los README de fase, no escribiendo desde cero.
 
 ---
 
@@ -155,7 +155,7 @@ Tener esto escrito de antemano importa porque un incidente real a las 3am con di
 | Fase 2 | Docstrings en `evaluator.py`, `fees.py`. ADR: criterio de staleness. Primera entrada en `calibrations.md`. |
 | Fase 3 | Docstrings en `risk.py`, `executor.py`. ADR: ejecución paralela + reconciliación. ADR: circuit breaker. Runbook de reconciliación. `docs/fases/fase3.md` con resultados del dry run. |
 | Fase 4 | Docstrings en `telegram_bot.py`. Documentar comandos disponibles (`/status`, `/kill`, etc.) en el README. |
-| Fase 5 | Documentar procedimiento de despliegue paso a paso (para vos mismo, si reinstalás en un VPS nuevo). Commit explícito con contexto al pasar a `DRY_RUN=False` (ya cubierto en el roadmap de Git, referenciarlo acá también). |
+| Fase 5 | Documentar procedimiento de despliegue paso a paso (para reinstalar en un VPS nuevo si hace falta). Commit explícito con contexto al pasar a `DRY_RUN=False` (ya cubierto en `roadmap_git_DQ.md`, referenciarlo acá también). |
 | Fase 6 | ADR: decisión de sizing dinámico si se implementa. README general consolidado. |
 
 ---

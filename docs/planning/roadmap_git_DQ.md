@@ -1,8 +1,8 @@
 # Roadmap de Git: DeltaQuant (Bot de Arbitraje Triangular)
 
-Complementa a `plan_bot_arbitraje_triangular.md`. Define cómo versionar el trabajo fase a fase para tener un historial profesional, revisable y con puntos de rollback claros — útil incluso siendo el único dev, porque en un proyecto que maneja capital real vas a necesitar poder auditar "qué cambió, cuándo, y por qué" cuando algo salga mal.
+Complementa a `plan_DeltaQuant.md`. Define cómo versionar el trabajo fase a fase para tener un historial profesional, revisable y con puntos de rollback claros — útil incluso siendo el único dev, porque en un proyecto que maneja capital real voy a necesitar poder auditar "qué cambió, cuándo, y por qué" cuando algo salga mal.
 
-> **Idioma:** nombres de rama, mensajes de commit, y títulos/descripciones de PR van **en inglés** — es el estándar de facto en el ecosistema open source y de herramientas de dev (Git, GitHub, changelogs autogenerados), y mantiene el repo consistente si en algún momento lo compartís o lo usás como parte de un portfolio. Todos los ejemplos de este documento ya están en inglés.
+> **Idioma:** nombres de rama, mensajes de commit, y títulos/descripciones de PR van **en inglés** — es el estándar de facto en el ecosistema open source y de herramientas de dev (Git, GitHub, changelogs autogenerados), y mantiene el repo consistente si en algún momento se comparte o se usa como parte de un portfolio. Todos los ejemplos de este documento ya están en inglés.
 
 ---
 
@@ -40,7 +40,7 @@ Ejemplos:
 
 ## 2. Convención de Commits
 
-[Conventional Commits](https://www.conventionalcommits.org/), con `scope` = módulo del proyecto (te da un historial filtrable por `git log --grep` o por scope cuando necesites auditar solo `risk` o solo `executor`, por ejemplo).
+[Conventional Commits](https://www.conventionalcommits.org/), con `scope` = módulo del proyecto (da un historial filtrable por `git log --grep` o por scope cuando se necesite auditar solo `risk` o solo `executor`, por ejemplo).
 
 ```
 <type>(<scope>): <imperative, lowercase description, no trailing period>
@@ -69,7 +69,7 @@ docs: add risk management section to technical plan
 chore(infra): multi-stage Dockerfile to reduce image size
 ```
 
-**Commits atómicos:** un commit = un cambio lógico coherente. Si la descripción necesita "y" para explicarlo, probablemente son dos commits. Esto es lo que te permite después usar `git bisect` sin sufrir, si en producción aparece un bug y no sabés en qué commit se introdujo.
+**Commits atómicos:** un commit = un cambio lógico coherente. Si la descripción necesita "y" para explicarlo, probablemente son dos commits. Esto es lo que permite después usar `git bisect` sin sufrir, si en producción aparece un bug y no se sabe en qué commit se introdujo.
 
 ---
 
@@ -86,19 +86,19 @@ v0.5.0-fase5-vps-dryrun   # Desplegado en VPS, aún en DRY_RUN
 v1.0.0-live               # Primera vez con DRY_RUN=False y capital real
 ```
 
-El salto a `v1.0.0` es deliberadamente significativo — marca el único momento del proyecto donde el riesgo cambia de "bug en el código" a "bug con dinero real perdido". Vale la pena que ese tag sea memorable y que el commit que lo acompaña incluya en el mensaje qué capital de prueba y qué límites de `risk.py` estaban activos en ese momento exacto (referencia rápida si después necesitás reconstruir el contexto).
+El salto a `v1.0.0` es deliberadamente significativo — marca el único momento del proyecto donde el riesgo cambia de "bug en el código" a "bug con dinero real perdido". Vale la pena que ese tag sea memorable y que el commit que lo acompaña incluya en el mensaje qué capital de prueba y qué límites de `risk.py` estaban activos en ese momento exacto (referencia rápida si después se necesita reconstruir el contexto).
 
 ---
 
-## 4. Pull Requests (aunque seas el único dev)
+## 4. Pull Requests (aunque sea el único dev)
 
 Aunque no haya otro reviewer, abrir PR de `feature/*` → `develop` en vez de mergear directo tiene valor real acá:
 
-- Te obliga a revisar el diff completo antes de integrar (revisión asincrónica de vos mismo, con la cabeza fría de "¿esto es lo que quería escribir?").
+- Obliga a revisar el diff completo antes de integrar (revisión asincrónica con la cabeza fría de "¿esto es lo que quería escribir?").
 - Cada PR es la unidad natural para correr el checklist de tests de esa tarea antes de integrar.
-- Queda un registro searchable de decisiones — podés poner en la descripción del PR *por qué* elegiste, por ejemplo, ejecutar las 3 patas en paralelo y no secuencial, y ese razonamiento no se pierde en el historial de commits sueltos.
+- Queda un registro searchable de decisiones — se puede poner en la descripción del PR *por qué* se eligió, por ejemplo, ejecutar las 3 patas en paralelo y no secuencial, y ese razonamiento no se pierde en el historial de commits sueltos.
 
-**Squash merge** de `feature/*` a `develop`: mantiene el historial de `develop` limpio (un commit resumen por feature), mientras que el detalle de commits atómicos queda preservado en la rama del PR si necesitás bucear.
+**Squash merge** de `feature/*` a `develop`: mantiene el historial de `develop` limpio (un commit resumen por feature), mientras que el detalle de commits atómicos queda preservado en la rama del PR si se necesita bucear.
 
 `develop` → `main`: **merge commit** (no squash), para preservar la trazabilidad de qué conjunto de features compone cada release taggeada.
 
@@ -121,7 +121,7 @@ Si la PR agrupa varias tareas relacionadas de un mismo bloque del checklist de f
 
 ### 4.2 Descripción de la PR (template)
 
-Usar siempre esta estructura, incluso siendo el único revisor — es lo que te da el registro de decisiones que después alimenta los ADRs (`plan_documentacion_bot_arbitraje.md`, §3):
+Usar siempre esta estructura, incluso siendo el único revisor — es lo que da el registro de decisiones que después alimenta los ADRs (`plan_doc_DQ.md`, §3):
 
 ```markdown
 ## What it does
@@ -236,6 +236,6 @@ test/f6-bybit-adapter-interface-compliance
 
 ## 6. Extras recomendados
 
-- **`CHANGELOG.md` autogenerado**: como venís con Conventional Commits, herramientas como `git-cliff` o `commitizen` generan el changelog automáticamente a partir del historial — sin mantenimiento manual.
+- **`CHANGELOG.md` autogenerado**: con Conventional Commits, herramientas como `git-cliff` o `commitizen` generan el changelog automáticamente a partir del historial — sin mantenimiento manual.
 - **Nunca commitear `.env`**: solo `.env.example` versionado, con placeholders. Doble chequeo en `.gitignore` desde el primer commit de la Fase 1, antes de que exista ninguna credencial real en el filesystem del repo.
 - **Pre-commit hook** para evitar commitear secretos por accidente (`detect-secrets` o similar) — barato de configurar en Fase 1 y elimina una categoría entera de errores humanos después.
