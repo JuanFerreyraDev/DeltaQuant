@@ -21,6 +21,23 @@ Notes on ccxt usage:
     ``asyncio.get_event_loop().run_in_executor`` so they don't block the
     event loop, even though the full async pipeline is not wired until Phase 2.
 
+Symbol format contract (ADR-002):
+    The engine layer (``core/graph.py``) produces symbols in a mixed native
+    format:
+
+    - USDT-quoted pairs: concatenated native format (e.g. ``"BTCUSDT"``),
+      because the fixed 4-char ``"USDT"`` suffix makes the split unambiguous.
+    - Cross pairs (non-USDT quote): slash-delimited unified format
+      (e.g. ``"ETH/BTC"``), because concatenation is ambiguous without a
+      known-assets list and ``parse_symbol`` cannot recover base/quote from
+      ``"ETHBTC"``.
+
+    This adapter accepts both formats.  ``_native_to_unified`` converts
+    concatenated USDT symbols to ccxt unified format and passes slash-delimited
+    symbols through unchanged.  ``_unified_to_native`` is only safe for
+    USDT-quoted symbols (``"BTC/USDT"`` → ``"BTCUSDT"``); do not call it on
+    cross-pair unified symbols.
+
 Security:
     API keys are read from ``Settings`` at construction time.  No key or
     secret is ever stored as a plain module-level variable or logged.
@@ -43,6 +60,72 @@ from exchanges.base import (
     OrderResult,
     TradingFees,
 )
+
+
+# ── Symbol format conversion ──────────────────────────────────────────────────
+
+
+def _native_to_unified(native_symbol: str) -> str:
+    """Convert a symbol to ccxt unified format (``"BASE/QUOTE"``).
+
+    Handles the two symbol formats that the engine layer produces:
+
+    - **Concatenated USDT pairs** (e.g. ``"BTCUSDT"``): the fixed 4-char
+      ``"USDT"`` suffix is unambiguous, so the function strips it and
+      inserts a slash → ``"BTC/USDT"``.
+    - **Slash-delimited cross pairs** (e.g. ``"ETH/BTC"``): already in
+      unified format — passed through unchanged.
+
+    This function must not be called with an ambiguous concatenated
+    cross-pair symbol like ``"ETHBTC"``; ``parse_symbol("ETHBTC")`` returns
+    ``None``, and there is no safe way to recover the split without a
+    known-assets list.  The graph layer avoids producing such symbols by
+    using slash-delimited format for all non-USDT pairs (see ADR-002).
+
+    Args:
+        native_symbol: Symbol string from the engine layer — either a
+            concatenated USDT pair (e.g. ``"BTCUSDT"``) or a slash-delimited
+            cross pair (e.g. ``"ETH/BTC"``).
+
+    Returns:
+        ccxt unified symbol string with a ``/`` delimiter,
+        e.g. ``"BTC/USDT"`` or ``"ETH/BTC"``.
+    """
+    # Slash-delimited symbols are already in unified format — pass through.
+    if "/" in native_symbol:
+        return native_symbol
+
+    # Concatenated USDT pairs: strip the 4-char suffix and insert a slash.
+    if native_symbol.endswith("USDT") and len(native_symbol) > 4:
+        base = native_symbol[:-4]
+        return f"{base}/USDT"
+
+    # Anything else is an unrecognised format.  Return as-is so the ccxt
+    # call surfaces the error with a clear BadSymbol exception rather than
+    # a silent wrong lookup.
+    return native_symbol
+
+
+def _unified_to_native(unified_symbol: str) -> str:
+    """Convert a ccxt unified USDT symbol to concatenated native format.
+
+    Removes the ``/`` delimiter from a USDT-quoted unified symbol:
+    ``"BTC/USDT"`` → ``"BTCUSDT"``.
+
+    **Scope**: safe only for USDT-quoted symbols.  Calling this on a
+    cross-pair unified symbol (e.g. ``"ETH/BTC"``) produces the ambiguous
+    concatenated form ``"ETHBTC"``, which ``parse_symbol`` cannot recover.
+    Do not call this function on cross-pair symbols — the engine already
+    stores them in slash-delimited format and should receive them back
+    unchanged.
+
+    Args:
+        unified_symbol: ccxt unified USDT symbol, e.g. ``"BTC/USDT"``.
+
+    Returns:
+        Concatenated native symbol, e.g. ``"BTCUSDT"``.
+    """
+    return unified_symbol.replace("/", "")
 
 
 class BinanceAdapter(ExchangeAdapter):
@@ -159,8 +242,13 @@ class BinanceAdapter(ExchangeAdapter):
         Not implemented in Phase 1.  WebSocket connectivity via ccxt.pro is
         introduced in Phase 2 (``feature/f2-binance-ws-bookticker``).
 
+        **Symbol format**: will accept native format symbols (e.g. ``"BTCUSDT"``)
+        and convert to unified format internally for ccxt.pro calls. See ADR-002
+        for the symbol format contract.
+
         Args:
-            symbols: List of symbols to subscribe to.
+            symbols: List of native format symbols to subscribe to (e.g.
+                ``["BTCUSDT", "ETHUSDT"]``).
 
         Raises:
             NotImplementedError: Always, in Phase 1.
@@ -182,27 +270,39 @@ class BinanceAdapter(ExchangeAdapter):
         this adapter instance; fee tiers change rarely and a per-request round-
         trip is wasteful during the high-frequency evaluation cycle.
 
+        **Symbol format**: accepts both engine symbol formats (ADR-002):
+        concatenated USDT pairs (e.g. ``"BTCUSDT"``) and slash-delimited
+        cross pairs (e.g. ``"ETH/BTC"``).  ``_native_to_unified`` converts
+        to the ccxt format required by ``fetch_trading_fee``.  The cache key
+        is the symbol exactly as received from the engine, so USDT and cross
+        pairs are cached independently and consistently.
+
         BNB fee discount (25 % reduction when paying fees in BNB) is NOT
         applied here — that calculation is deferred to ``exchanges/fees.py``
         in Phase 2, which wraps this method and adjusts the effective rate.
 
         Args:
-            symbol: Binance native symbol string, e.g. ``"BTCUSDT"``.
+            symbol: Symbol string from the engine — concatenated USDT pair
+                (e.g. ``"BTCUSDT"``) or slash-delimited cross pair
+                (e.g. ``"ETH/BTC"``).
 
         Returns:
             ``TradingFees`` with ``maker`` and ``taker`` as ``Decimal``
             fractions (e.g. ``Decimal("0.001")`` = 0.1 %).
 
         Raises:
-            ccxt.BadSymbol: If ``symbol`` is not recognised by Binance.
+            ccxt.BadSymbol: If the symbol is not recognised by Binance.
             ccxt.NetworkError: On connectivity failure.
         """
         if symbol in self._fee_cache:
             return self._fee_cache[symbol]
 
+        # Convert from native (engine format) to unified (ccxt format)
+        unified_symbol = _native_to_unified(symbol)
+
         loop = asyncio.get_event_loop()
         raw: dict = await loop.run_in_executor(
-            None, self._client.fetch_trading_fee, symbol
+            None, self._client.fetch_trading_fee, unified_symbol
         )
 
         fees = TradingFees(
@@ -259,8 +359,13 @@ class BinanceAdapter(ExchangeAdapter):
         introduced in Phase 3 (``feature/f3-executor-parallel-dryrun``),
         initially in DRY_RUN mode, and goes live in Phase 5.
 
+        **Symbol format**: accepts native format symbols (e.g. ``"BTCUSDT"``)
+        and will convert to unified format internally for ccxt calls (see ADR-002).
+
         Args:
-            symbol: Binance native symbol string.
+            symbol: Symbol string from the engine — concatenated USDT pair
+                (e.g. ``"BTCUSDT"``) or slash-delimited cross pair
+                (e.g. ``"ETH/BTC"``).
             side: ``"BUY"`` or ``"SELL"``.
             quantity: Base-asset quantity.
             price: Limit price in quote-asset units.
