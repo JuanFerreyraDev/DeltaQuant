@@ -93,32 +93,51 @@ Rationale documented in **ADR-001**
 - `subscribe_book_ticker` and `place_fok_order`: raise `NotImplementedError`
   with explicit phase references in the error messages.
 
-### Triangle graph (`feature/f1-graph-triangle-generation`)
+### Triangle graph (`feature/f1-graph-triangle-generation` + `fix/f1-graph-usdt-filter-and-triangle-constraint`)
 
 `core/graph.py`:
 
 - `filter_pairs_by_volume(raw_tickers, min_volume_usdt) → list[TradingPair]`:
-  accepts raw ccxt tickers, keeps USDT-quoted pairs strictly above the volume
-  threshold, tolerates missing/malformed `quoteVolume` fields (treated as
-  zero), returns results sorted by volume descending.
+  accepts raw ccxt tickers, keeps both USDT-quoted pairs and cross pairs
+  strictly above the volume threshold, tolerates missing/malformed
+  `quoteVolume` fields (treated as zero), returns results sorted by volume
+  descending.  For USDT-quoted pairs the raw `quoteVolume` is used directly;
+  for cross pairs the USDT-equivalent is computed as
+  `quoteVolume × quote-asset USDT price` sourced from the same ticker batch.
+  Cross pairs whose quote asset has no USDT listing in the batch are excluded
+  gracefully (no fallback, no crash).  Design rationale and accepted
+  limitations documented in **ADR-003**
+  (`docs/adr/ADR-003-volume-normalization-cross-pairs.md`).
+- `_build_quote_asset_prices(raw_tickers)`: helper that extracts a
+  `{asset: Decimal}` price map from all USDT-quoted tickers in the batch,
+  used by the volume filter for cross-pair conversion.
 - `generate_triangles(pairs) → list[Triangle]`:
   builds a `frozenset`-keyed pair index for O(1) edge lookups, constructs an
   adjacency list, enumerates all A-B-C-A cycles, canonicalises each triplet
   via lexicographic sort before inserting into a `seen` set — guaranteeing
   zero duplicate triangles regardless of graph size or traversal order.
+  Enforces the USDT constraint: every returned triangle must include USDT as
+  one of its three assets (no USDT leg → no entry/exit point for the bot).
   Returns results sorted by `(asset_a, asset_b, asset_c)` for deterministic
   output.
 - Module is exchange-agnostic: no import of `BinanceAdapter` or `ccxt`.
 
-### Test suite (`test/f1-graph-no-duplicates`)
+Symbol format contract documented in **ADR-002**
+(`docs/adr/ADR-002-symbol-format-contract.md`): USDT-quoted pairs use
+concatenated native format (e.g. `BTCUSDT`); cross pairs use slash-delimited
+unified format (e.g. `ETH/BTC`) because concatenation is ambiguous without a
+known-assets list.
 
-`tests/test_graph.py` — 33 unit tests across three classes:
+### Test suite (`test/f1-graph-no-duplicates` + `fix/f1-graph-usdt-filter-and-triangle-constraint`)
+
+`tests/test_graph.py` — 42 tests across four classes:
 
 | Class | Tests | What is covered |
 |---|---|---|
 | `TestParseSymbol` | 8 | Slash format, native USDT suffix, lowercased input, non-USDT native → None, malformed, empty, bare "USDT" |
-| `TestFilterPairsByVolume` | 12 | Empty list, all below, exactly at threshold (excluded), strictly above, mixed, non-USDT ignored, missing/malformed volume, sorted output, field accuracy, zero threshold, native symbol format |
-| `TestGenerateTriangles` | 13 | Empty/1/2 pairs, 3 pairs no triangle, minimal triangle, no duplicates (symmetric pairs), no duplicates (larger graph), exact count (5 triangles in 8-pair graph), pair symbols valid, distinct assets, deterministic, sorted, isolated pair excluded |
+| `TestFilterPairsByVolume` | 16 | Empty list, all below, exactly at threshold (excluded), strictly above, mixed, cross pair excluded without quote price, missing/malformed volume, sorted output, field accuracy, Decimal type enforcement, zero threshold, native symbol format for USDT pairs, cross pair uses slash-delimited symbol, cross pair round-trips through `parse_symbol` |
+| `TestGenerateTriangles` | 14 | Empty/1/2 pairs, 3 pairs no triangle, minimal triangle, no duplicates (symmetric pairs), no duplicates (larger graph), exact count (4 USDT triangles in 8-pair graph), pair symbols valid, distinct assets, deterministic, sorted, isolated pair excluded, USDT constraint excludes non-USDT triangles, USDT triangle included |
+| `TestFilterAndGeneratePipeline` | 4 | Full pipeline with cross pair generates triangle (verifies `quoteVolume × price` math), cross pair below volume excluded, cross pair with missing quote price excluded, non-USDT-only graph produces no triangles |
 
 All tests use fabricated data only.  No real API calls, no credentials.
 
@@ -135,8 +154,8 @@ Covers context, decision, consequences, and three rejected alternatives.
 
 ## What was validated
 
-- **33/33 unit tests pass** against `core/graph.py` with no mocking of
-  external dependencies (the module has none).
+- **42/42 unit and integration tests pass** against `core/graph.py` with no
+  mocking of external dependencies (the module has none).
 - Manual import smoke-test: `python main.py` exits cleanly after importing
   `config.settings`, confirming the package structure is correct.
 - `.gitignore` verified: `git status` on a branch with a `.env` file present
@@ -177,20 +196,6 @@ Per the technical plan §8, Fase 2 scope:
 ---
 
 ## Open questions / deferred decisions
-
-- **Non-USDT triangle legs**: Phase 1 now accepts cross pairs (like `ETH/BTC`)
-  in the volume filter. For non-USDT-quoted pairs, `baseVolume` is compared
-  directly against the USDT-denominated threshold (Phase 1 simplification to
-  avoid a price-lookup loop). The consequence: a cross pair passes the filter
-  if its base-asset volume is high, which is a reasonable proxy for liquidity
-  but not a strict USDT-equivalent measure. True volume conversion (cross pair
-  quantified in USDT using the quote asset's price) is deferred to Phase 2
-  once real pair data has been observed and the overhead is justified.
-
-  **USDT constraint** (now enforced): All triangles returned by
-  `generate_triangles` must include USDT as one of the three assets. This
-  reflects the bot's dependency on USDT as its held capital: a triangle with
-  no USDT leg (e.g. BTC-ETH-BNB) cannot be entered or exited.
 
 - **Leveraged token filtering**: the volume filter currently passes pairs like
   `BTC3LUSDT` if their volume exceeds the threshold.  These are not suitable
