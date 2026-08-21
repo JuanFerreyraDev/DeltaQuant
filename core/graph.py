@@ -5,8 +5,11 @@ and §3 "Flujo de evaluación"):
 
 1. **Volume filter** (step 1 of the evaluation flow): given a list of raw ccxt
    ticker dicts, discard any pair whose 24-hour quote-asset volume is below the
-   ``MIN_VOLUME_USDT`` threshold defined in ``Settings``.  Only USDT-quoted
-   pairs are considered (the base currency of the account).
+   ``MIN_VOLUME_USDT`` threshold defined in ``Settings``.  Both USDT-quoted
+   pairs and cross pairs (e.g. ``ETH/BTC``) are accepted.  For USDT-quoted
+   pairs the raw ``quoteVolume`` is used directly; for cross pairs the volume
+   is normalized to a USDT-equivalent by multiplying ``quoteVolume`` by the
+   quote asset's USDT price sourced from the same ticker batch (see ADR-003).
 
 2. **Triangle generation** (step 2): from the filtered symbol set, enumerate
    all closed triangles of the form ``A → B → C → A`` where each directed
@@ -33,7 +36,6 @@ Design note:
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from decimal import Decimal
 from typing import NamedTuple
@@ -50,9 +52,11 @@ class TradingPair(NamedTuple):
         base: Base asset ticker, e.g. ``"BTC"``.
         quote: Quote asset ticker, e.g. ``"USDT"``.
         volume_usdt: 24-hour volume expressed in USDT.  For USDT-quoted pairs
-            this is the raw ``quoteVolume``; for non-USDT pairs it is set to
-            ``Decimal("0")`` (they are never included in the filtered set used
-            for graph construction).
+            this is the raw ``quoteVolume``; for non-USDT pairs it is the
+            USDT-equivalent computed as ``quoteVolume × quote-asset USDT price``
+            (see ADR-003).  Non-USDT pairs are excluded only when the quote
+            asset's USDT price is absent from the ticker batch — not as a
+            blanket rule.
     """
 
     symbol: str
@@ -88,13 +92,6 @@ class Triangle(NamedTuple):
 
 
 # ── Volume filter ─────────────────────────────────────────────────────────────
-
-# Regex that matches the Binance-style native symbol for USDT-quoted pairs.
-# e.g. "BTCUSDT", "ETHUSDT", "BNBUSDT".  Excludes leveraged tokens
-# (containing digits like "BTC3L"), stablecoins-vs-stablecoin pairs, etc.
-# The evaluator in Phase 2 may apply additional filters; this is the coarse
-# first pass.
-_USDT_SYMBOL_RE = re.compile(r"^[A-Z]+USDT$")
 
 
 def parse_symbol(symbol: str) -> tuple[str, str] | None:
