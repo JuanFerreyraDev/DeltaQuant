@@ -128,23 +128,23 @@ concatenated native format (e.g. `BTCUSDT`); cross pairs use slash-delimited
 unified format (e.g. `ETH/BTC`) because concatenation is ambiguous without a
 known-assets list.
 
-### Test suite (`test/f1-graph-no-duplicates` + `fix/f1-graph-usdt-filter-and-triangle-constraint` + `test/f1-missing-unit-coverage`)
+### Test suite (`test/f1-graph-no-duplicates` + `fix/f1-graph-usdt-filter-and-triangle-constraint` + `test/f1-missing-unit-coverage` + `fix/f1-binance-adapter-create-connectivity-check`)
 
-**115 tests across 7 test classes in 4 files.** All use fabricated data only —
-no real API calls, no credentials anywhere in the test suite.
+**120 tests across 8 test classes in 5 files** (verified with `pytest --collect-only`).
+All use fabricated data only — no real API calls, no credentials anywhere in the test suite.
 
-#### `tests/test_graph.py` — 45 tests
+#### `tests/test_graph.py` — 45 cases
 
-| Class | Tests | What is covered |
+| Class | Cases | What is covered |
 |---|---|---|
 | `TestParseSymbol` | 9 | Slash format, native USDT suffix, lowercased input, non-USDT native → None, malformed, empty, bare "USDT", multi-slash returns None |
 | `TestFilterPairsByVolume` | 18 | Empty list, all below, exactly at threshold (excluded), strictly above, mixed, cross pair excluded without quote price, cross pair included with correct USDT-equivalent volume, cross pair with missing quoteVolume excluded, missing/malformed volume, sorted output, field accuracy, Decimal type enforcement, zero threshold, native symbol format for USDT pairs, cross pair uses slash-delimited symbol, cross pair round-trips through `parse_symbol` |
 | `TestGenerateTriangles` | 14 | Empty/1/2 pairs, 3 pairs no triangle, minimal triangle, no duplicates (symmetric pairs), no duplicates (larger graph), exact count (4 USDT triangles in 8-pair graph), pair symbols valid, distinct assets, deterministic, sorted, isolated pair excluded, USDT constraint excludes non-USDT triangles, USDT triangle included |
 | `TestFilterAndGeneratePipeline` | 4 | Full pipeline with cross pair generates triangle (verifies `quoteVolume × price` math), cross pair below volume excluded, cross pair with missing quote price excluded, non-USDT-only graph produces no triangles |
 
-#### `tests/test_base.py` — 22 tests
+#### `tests/test_base.py` — 18 cases
 
-| Class | Tests | What is covered |
+| Class | Cases | What is covered |
 |---|---|---|
 | `TestBalance` | 5 | `total` with free+locked, both zero, locked zero, free zero; frozen enforcement |
 | `TestOrderResult` | 7 | `is_filled` all four boolean combinations (FILLED+nonzero → True, FILLED+zero → False, EXPIRED+nonzero → False, EXPIRED+zero → False), CANCELLED case, `raw` defaults to `{}`, mutable field update |
@@ -152,23 +152,35 @@ no real API calls, no credentials anywhere in the test suite.
 | `TestBookTicker` | 2 | Construction and frozen enforcement |
 | `TestExchangeAdapterABC` | 2 | Direct instantiation raises `TypeError`; incomplete subclass also raises `TypeError` |
 
-#### `tests/test_symbol_helpers.py` — 12 tests
+#### `tests/test_symbol_helpers.py` — 12 cases
 
-| Class | Tests | What is covered |
+| Class | Cases | What is covered |
 |---|---|---|
 | `TestNativeToUnified` | 7 | USDT pair, multi-char base, slash passthrough, non-USDT concatenated fallthrough (returns as-is), bare `"USDT"` length guard, minimum 5-char pair, cross pair with non-USDT quote |
 | `TestUnifiedToNative` | 5 | `BTC/USDT` → `BTCUSDT`, multi-char base, no-slash no-op, empty string, cross pair slash removal (documented out-of-scope per ADR-002) |
 
-#### `tests/test_settings.py` — 22 tests (+ 12 parametrized cases)
+#### `tests/test_settings.py` — 40 cases
 
-| Class | Tests | What is covered |
+Three test methods use `@pytest.mark.parametrize`; counts below reflect executed cases, not method count.
+
+| Class | Cases | Notes |
 |---|---|---|
-| `TestValidateLogLevel` | 3 | All 7 valid levels accepted, case normalisation to uppercase, 5 invalid values raise `ValidationError` |
-| `TestValidateNotPlaceholder` | 3 | 6 rejection triggers for `BINANCE_API_KEY`, 3 for `BINANCE_API_SECRET`, real-looking key passes |
-| `TestFieldConstraints` | 9 | `MIN_VOLUME_USDT`, `SAFETY_MARGIN`, `MAX_TICK_AGE_MS`, `MAX_POSITION_USDT`, `DAILY_LOSS_LIMIT_USDT`, `MAX_CONCURRENT_TRIANGLES`, `REDIS_PORT` lower and upper bounds, `REDIS_DB` |
+| `TestValidateLogLevel` | 16 | 7 parametrized valid levels + 4 parametrized case-normalisation inputs + 5 parametrized invalid values |
+| `TestValidateNotPlaceholder` | 10 | 6 parametrized API key rejections + 3 parametrized secret rejections + 1 valid passthrough |
+| `TestFieldConstraints` | 9 | One method per constrained field: `MIN_VOLUME_USDT`, `SAFETY_MARGIN`, `MAX_TICK_AGE_MS`, `MAX_POSITION_USDT`, `DAILY_LOSS_LIMIT_USDT`, `MAX_CONCURRENT_TRIANGLES`, `REDIS_PORT` lower and upper bounds, `REDIS_DB` |
 | `TestExtraForbid` | 1 | Unknown field raises `ValidationError` |
 | `TestDefaults` | 2 | `DRY_RUN=True` default, numeric defaults sanity check |
 | `TestGetSettings` | 2 | Same-object identity on repeated calls (`lru_cache`), `cache_clear()` allows re-read of updated environment |
+
+#### `tests/test_binance_adapter_create.py` — 5 cases
+
+Bug discovered during Phase 1 review, fixed in `fix/f1-binance-adapter-create-connectivity-check`
+(separate from the three original fixes). See "Bug fix: `create()` connectivity
+contract" below.
+
+| Class | Cases | What is covered |
+|---|---|---|
+| `TestBinanceAdapterCreate` | 5 | `load_markets()` called during `create()`; `_markets_cache` pre-populated after `create()`; `AuthenticationError` from `load_markets()` propagates; `NetworkError` propagates; subsequent `get_markets()` does not trigger a second `load_markets()` call |
 
 `pytest.ini` added: `pythonpath = .` (project root on `sys.path`) and
 `asyncio_mode = auto` (ready for async tests in Phase 2+).
@@ -183,9 +195,10 @@ Covers context, decision, consequences, and three rejected alternatives.
 
 ## What was validated
 
-- **115/115 tests pass** across `core/graph.py`, `exchanges/base.py`,
-  `exchanges/binance_adapter.py` (symbol helpers), and `config/settings.py`,
-  with no mocking of external dependencies in the graph and base modules.
+- **120/120 tests pass** (`pytest --collect-only` confirms 120 cases across 5
+  test files), with no mocking of external dependencies in the graph and base
+  modules; `test_binance_adapter_create.py` mocks `ccxt.binance` at the class
+  level.
 - Manual import smoke-test: `python main.py` exits cleanly after importing
   `config.settings`, confirming the package structure is correct.
 - `.gitignore` verified: `git status` on a branch with a `.env` file present
@@ -193,6 +206,38 @@ Covers context, decision, consequences, and three rejected alternatives.
   first commit.
 - No credentials, API keys, or secrets appear anywhere in the repository,
   including test fixtures.
+
+---
+
+## Bug fix: `create()` connectivity contract (`fix/f1-binance-adapter-create-connectivity-check`)
+
+Discovered during Phase 1 review — not part of the original three fix branches.
+
+**The bug:** `BinanceAdapter.create()` docstring promised a connectivity check
+via `load_markets()` and declared `ccxt.AuthenticationError` as a possible
+raise. The implementation only called `ccxt.binance(...)` in memory — no
+network request, no credential validation. An adapter built with an invalid API
+key would succeed silently until the first operational call hit the network
+(`fetch_tickers_24h`, `get_balance`, etc.), contradicting the fail-fast
+principle applied everywhere else in Phase 1 (same spirit as `extra="forbid"`
+in `Settings`).
+
+**The fix** (`exchanges/binance_adapter.py`):
+- Merged client construction and `load_markets()` into a single
+  `_build_and_load()` closure executed inside `run_in_executor` — the event
+  loop is never blocked.
+- `AuthenticationError` and `NetworkError` from `load_markets()` now propagate
+  to the caller at startup, as documented.
+- `adapter._markets_cache` is pre-populated from `client.markets` on success,
+  so the first `get_markets()` call is free (no second round-trip).
+- Also replaced `asyncio.get_event_loop()` with `asyncio.get_running_loop()`
+  across all five call sites in the adapter (`create`, `fetch_tickers_24h`,
+  `get_trading_fees`, `get_balance`, `get_markets`) — `get_event_loop()`
+  emits `DeprecationWarning` in Python 3.10+ when called inside a running
+  coroutine.
+
+**Tested in** `tests/test_binance_adapter_create.py` (5 cases, all mocking
+`ccxt.binance` at the class level — no real network calls).
 
 ---
 
