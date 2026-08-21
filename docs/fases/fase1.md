@@ -128,18 +128,47 @@ concatenated native format (e.g. `BTCUSDT`); cross pairs use slash-delimited
 unified format (e.g. `ETH/BTC`) because concatenation is ambiguous without a
 known-assets list.
 
-### Test suite (`test/f1-graph-no-duplicates` + `fix/f1-graph-usdt-filter-and-triangle-constraint`)
+### Test suite (`test/f1-graph-no-duplicates` + `fix/f1-graph-usdt-filter-and-triangle-constraint` + `test/f1-missing-unit-coverage`)
 
-`tests/test_graph.py` — 42 tests across four classes:
+**115 tests across 7 test classes in 4 files.** All use fabricated data only —
+no real API calls, no credentials anywhere in the test suite.
+
+#### `tests/test_graph.py` — 45 tests
 
 | Class | Tests | What is covered |
 |---|---|---|
-| `TestParseSymbol` | 8 | Slash format, native USDT suffix, lowercased input, non-USDT native → None, malformed, empty, bare "USDT" |
-| `TestFilterPairsByVolume` | 16 | Empty list, all below, exactly at threshold (excluded), strictly above, mixed, cross pair excluded without quote price, missing/malformed volume, sorted output, field accuracy, Decimal type enforcement, zero threshold, native symbol format for USDT pairs, cross pair uses slash-delimited symbol, cross pair round-trips through `parse_symbol` |
+| `TestParseSymbol` | 9 | Slash format, native USDT suffix, lowercased input, non-USDT native → None, malformed, empty, bare "USDT", multi-slash returns None |
+| `TestFilterPairsByVolume` | 18 | Empty list, all below, exactly at threshold (excluded), strictly above, mixed, cross pair excluded without quote price, cross pair included with correct USDT-equivalent volume, cross pair with missing quoteVolume excluded, missing/malformed volume, sorted output, field accuracy, Decimal type enforcement, zero threshold, native symbol format for USDT pairs, cross pair uses slash-delimited symbol, cross pair round-trips through `parse_symbol` |
 | `TestGenerateTriangles` | 14 | Empty/1/2 pairs, 3 pairs no triangle, minimal triangle, no duplicates (symmetric pairs), no duplicates (larger graph), exact count (4 USDT triangles in 8-pair graph), pair symbols valid, distinct assets, deterministic, sorted, isolated pair excluded, USDT constraint excludes non-USDT triangles, USDT triangle included |
 | `TestFilterAndGeneratePipeline` | 4 | Full pipeline with cross pair generates triangle (verifies `quoteVolume × price` math), cross pair below volume excluded, cross pair with missing quote price excluded, non-USDT-only graph produces no triangles |
 
-All tests use fabricated data only.  No real API calls, no credentials.
+#### `tests/test_base.py` — 22 tests
+
+| Class | Tests | What is covered |
+|---|---|---|
+| `TestBalance` | 5 | `total` with free+locked, both zero, locked zero, free zero; frozen enforcement |
+| `TestOrderResult` | 7 | `is_filled` all four boolean combinations (FILLED+nonzero → True, FILLED+zero → False, EXPIRED+nonzero → False, EXPIRED+zero → False), CANCELLED case, `raw` defaults to `{}`, mutable field update |
+| `TestTradingFees` | 2 | Construction and frozen enforcement |
+| `TestBookTicker` | 2 | Construction and frozen enforcement |
+| `TestExchangeAdapterABC` | 2 | Direct instantiation raises `TypeError`; incomplete subclass also raises `TypeError` |
+
+#### `tests/test_symbol_helpers.py` — 12 tests
+
+| Class | Tests | What is covered |
+|---|---|---|
+| `TestNativeToUnified` | 7 | USDT pair, multi-char base, slash passthrough, non-USDT concatenated fallthrough (returns as-is), bare `"USDT"` length guard, minimum 5-char pair, cross pair with non-USDT quote |
+| `TestUnifiedToNative` | 5 | `BTC/USDT` → `BTCUSDT`, multi-char base, no-slash no-op, empty string, cross pair slash removal (documented out-of-scope per ADR-002) |
+
+#### `tests/test_settings.py` — 22 tests (+ 12 parametrized cases)
+
+| Class | Tests | What is covered |
+|---|---|---|
+| `TestValidateLogLevel` | 3 | All 7 valid levels accepted, case normalisation to uppercase, 5 invalid values raise `ValidationError` |
+| `TestValidateNotPlaceholder` | 3 | 6 rejection triggers for `BINANCE_API_KEY`, 3 for `BINANCE_API_SECRET`, real-looking key passes |
+| `TestFieldConstraints` | 9 | `MIN_VOLUME_USDT`, `SAFETY_MARGIN`, `MAX_TICK_AGE_MS`, `MAX_POSITION_USDT`, `DAILY_LOSS_LIMIT_USDT`, `MAX_CONCURRENT_TRIANGLES`, `REDIS_PORT` lower and upper bounds, `REDIS_DB` |
+| `TestExtraForbid` | 1 | Unknown field raises `ValidationError` |
+| `TestDefaults` | 2 | `DRY_RUN=True` default, numeric defaults sanity check |
+| `TestGetSettings` | 2 | Same-object identity on repeated calls (`lru_cache`), `cache_clear()` allows re-read of updated environment |
 
 `pytest.ini` added: `pythonpath = .` (project root on `sys.path`) and
 `asyncio_mode = auto` (ready for async tests in Phase 2+).
@@ -154,8 +183,9 @@ Covers context, decision, consequences, and three rejected alternatives.
 
 ## What was validated
 
-- **42/42 unit and integration tests pass** against `core/graph.py` with no
-  mocking of external dependencies (the module has none).
+- **115/115 tests pass** across `core/graph.py`, `exchanges/base.py`,
+  `exchanges/binance_adapter.py` (symbol helpers), and `config/settings.py`,
+  with no mocking of external dependencies in the graph and base modules.
 - Manual import smoke-test: `python main.py` exits cleanly after importing
   `config.settings`, confirming the package structure is correct.
 - `.gitignore` verified: `git status` on a branch with a `.env` file present
