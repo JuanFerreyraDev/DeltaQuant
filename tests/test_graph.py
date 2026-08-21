@@ -122,6 +122,10 @@ class TestParseSymbol:
         """'USDT' alone (base would be empty) returns None."""
         assert parse_symbol("USDT") is None
 
+    def test_slash_format_too_many_parts(self):
+        """Slash-delimited symbol with more than one slash returns None."""
+        assert parse_symbol("BTC/USDT/EXTRA") is None
+
 
 # ── filter_pairs_by_volume ────────────────────────────────────────────────────
 
@@ -293,6 +297,41 @@ class TestFilterPairsByVolume:
             f"Cross-pair symbol must be slash-delimited, got '{eth_btc.symbol}'"
         )
         assert "/" in eth_btc.symbol
+
+    def test_cross_pair_included_with_converted_volume(self):
+        """Non-USDT pair above threshold is included with USDT-equivalent volume.
+
+        When a quote-asset USDT price IS available in the batch, a cross pair
+        whose converted volume exceeds the threshold must appear in the result
+        with the correct volume_usdt = quoteVolume × quote_asset_price.
+
+        This is the positive counterpart to
+        ``test_non_usdt_pairs_excluded_without_quote_price``.
+        """
+        tickers = [
+            # BTC/USDT provides the BTC price for the ETH/BTC conversion.
+            {**_make_ticker("BTC/USDT", 10_000_000), "last": 50_000},
+            # ETH/BTC: quoteVolume = 100 BTC → USDT-eq = 100 × 50_000 = 5_000_000
+            {**_make_ticker("ETH/BTC", None), "quoteVolume": 100, "last": 0.06},
+        ]
+        result = filter_pairs_by_volume(tickers, self.THRESHOLD)
+
+        eth_btc = next((p for p in result if p.base == "ETH" and p.quote == "BTC"), None)
+        assert eth_btc is not None, "ETH/BTC should pass the volume filter"
+        expected_volume = Decimal("100") * Decimal("50000")  # 5_000_000
+        assert eth_btc.volume_usdt == expected_volume
+        assert isinstance(eth_btc.volume_usdt, Decimal)
+
+    def test_cross_pair_missing_quote_volume_excluded(self):
+        """Non-USDT pair with no quoteVolume field is excluded even if quote price exists."""
+        tickers = [
+            {**_make_ticker("BTC/USDT", 10_000_000), "last": 50_000},
+            # ETH/BTC: quoteVolume absent entirely
+            {"symbol": "ETH/BTC", "last": 0.06},
+        ]
+        result = filter_pairs_by_volume(tickers, self.THRESHOLD)
+        symbols = {p.symbol for p in result}
+        assert "ETH/BTC" not in symbols
 
     def test_cross_pair_symbol_round_trips_through_parse_symbol(self):
         """Every symbol stored in a TradingPair round-trips through parse_symbol.
