@@ -170,8 +170,11 @@ class BinanceAdapter(ExchangeAdapter):
         """Async factory: construct and return a ready ``BinanceAdapter``.
 
         Builds the ``ccxt.binance`` client with the credentials from
-        ``settings`` and runs a lightweight connectivity check (load markets)
-        off the event loop so the caller stays non-blocking.
+        ``settings``, then runs a real connectivity and authentication check
+        by calling ``load_markets()`` off the event loop.  This surfaces
+        invalid credentials (``ccxt.AuthenticationError``) and network
+        failures (``ccxt.NetworkError``) at startup rather than on the first
+        operational request.
 
         In Phase 2 this factory will also open the WebSocket connection.
 
@@ -180,15 +183,17 @@ class BinanceAdapter(ExchangeAdapter):
 
         Returns:
             A fully initialised ``BinanceAdapter`` ready to serve requests.
+            ``_markets_cache`` is pre-populated; the first call to
+            ``get_markets()`` returns immediately without a network round-trip.
 
         Raises:
             ccxt.AuthenticationError: If the API key or secret is invalid.
             ccxt.NetworkError: If Binance is unreachable.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
-        def _build_client() -> ccxt.binance:
-            return ccxt.binance(
+        def _build_and_load() -> ccxt.binance:
+            client = ccxt.binance(
                 {
                     "apiKey": settings.BINANCE_API_KEY,
                     "secret": settings.BINANCE_API_SECRET,
@@ -203,9 +208,18 @@ class BinanceAdapter(ExchangeAdapter):
                     },
                 }
             )
+            # load_markets() makes a real REST request to Binance.
+            # This is the connectivity + credential check: an invalid API key
+            # or unreachable host raises here, not on the first operational call.
+            client.load_markets()
+            return client
 
-        client = await loop.run_in_executor(None, _build_client)
-        return cls(client, settings)
+        client = await loop.run_in_executor(None, _build_and_load)
+        adapter = cls(client, settings)
+        # Pre-populate the instance cache from the already-loaded markets so
+        # the first get_markets() call is free.
+        adapter._markets_cache = client.markets
+        return adapter
 
     # ── Market data ───────────────────────────────────────────────────────────
 
