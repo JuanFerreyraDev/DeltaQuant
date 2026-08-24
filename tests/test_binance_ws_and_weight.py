@@ -285,3 +285,75 @@ class TestSubscribeBookTicker:
             assert adapter._ws_client is not None
         finally:
             ccxt_pro.binance = orig_binance
+
+    @pytest.mark.asyncio
+    async def test_sequential_single_symbol_pushes_not_synthesized(self, adapter):
+        """Verify generator yields ONLY symbols present in each individual push.
+
+        Simulates realistic ccxt.pro behavior where each push contains ONLY the
+        symbol whose price actually changed:
+          - Push 1: {"BTC/USDT": ...}
+          - Push 2: {"ETH/BTC": ...} (BTC/USDT is absent)
+          - Push 3: StopAsyncIteration
+
+        Probes for: a buggy implementation that caches or synthesizes ticks for
+        absent symbols on every push. If absent symbols were re-yielded, push 2
+        would yield both ETH/BTC and BTCUSDT (with a refreshed timestamp_ms),
+        which would defeat ADR-004's tick staleness check.
+        """
+        fake_ws = MagicMock()
+        call_counter = {"n": 0}
+
+        async def fake_watch(symbols_list):
+            call_counter["n"] += 1
+            await asyncio.sleep(0)
+            if call_counter["n"] == 1:
+                return {
+                    "BTC/USDT": {
+                        "symbol": "BTC/USDT",
+                        "bids": [[Decimal("50000.0"), Decimal("0.5")]],
+                        "asks": [[Decimal("50001.0"), Decimal("0.3")]],
+                    }
+                }
+            elif call_counter["n"] == 2:
+                return {
+                    "ETH/BTC": {
+                        "symbol": "ETH/BTC",
+                        "bids": [[Decimal("0.05"), Decimal("1.0")]],
+                        "asks": [[Decimal("0.0501"), Decimal("2.0")]],
+                    }
+                }
+            else:
+                raise StopAsyncIteration
+
+        fake_ws.watch_bids_asks = AsyncMock(side_effect=fake_watch)
+        adapter._ws_client = fake_ws
+
+        it = adapter.subscribe_book_ticker(["BTCUSDT", "ETH/BTC"])
+
+        collected = []
+        async for tick in it:
+            collected.append(tick)
+
+        # ── Assertions ────────────────────────────────────────────────────────
+        # Must yield exactly 2 ticks total across the 2 pushes (one per push).
+        assert len(collected) == 2, (
+            f"Expected exactly 2 ticks (1 per push), but got {len(collected)}. "
+            f"Symbols yielded: {[t.symbol for t in collected]}"
+        )
+
+        # First push yields ONLY BTCUSDT
+        assert collected[0].symbol == "BTCUSDT"
+        assert collected[0].bid == Decimal("50000.0")
+
+        # Second push yields ONLY ETH/BTC
+        assert collected[1].symbol == "ETH/BTC"
+        assert collected[1].bid == Decimal("0.05")
+
+        # Confirm BTCUSDT was NOT re-yielded in push 2
+        yielded_symbols = [t.symbol for t in collected]
+        assert yielded_symbols == ["BTCUSDT", "ETH/BTC"], (
+            f"Yielded sequence {yielded_symbols} indicates absent symbols were "
+            "synthesized or re-yielded."
+        )
+

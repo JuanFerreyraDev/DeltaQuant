@@ -338,6 +338,15 @@ class BinanceAdapter(ExchangeAdapter):
         are translated through ``_native_to_unified`` before being handed to
         ccxt.pro, which expects unified ``"BASE/QUOTE"`` strings.
 
+        **Payload semantics & Staleness correctness**: On each WebSocket push,
+        ``ccxt.pro.binance.watch_bids_asks(symbols)`` returns **only** the symbol(s)
+        whose price actually changed in that push message (verified directly in
+        ``ccxt.pro.binance`` source: ``watch_bids_asks`` -> ``watch_multi_ticker_helper``
+        -> ``handle_tickers_and_bids_asks``).  Symbols whose prices did not change
+        are omitted from the returned payload, so their cached ``BookTicker.timestamp_ms``
+        in the evaluator correctly stops advancing, allowing the staleness check
+        to accurately flag un-updated market legs.
+
         **Staleness semantics**: the yielded ``BookTicker.timestamp_ms`` is
         populated locally with ``time.time_ns() // 1_000_000`` at the moment
         the message is received from the WebSocket.  This is intentionally a
@@ -345,6 +354,13 @@ class BinanceAdapter(ExchangeAdapter):
         the staleness check in the evaluator is a defence against *local*
         data-freshness loss (disconnected socket, ccxt.pro queue backup, etc.)
         — exchange-side clock skew is irrelevant to that goal.
+
+        **Testability & Error handling semantics**: The ``except StopAsyncIteration``
+        branch exists solely to make this generator deterministically testable in
+        the test suite (allowing mocks to signal end of stream).  It does NOT
+        correspond to any exchange or ccxt.pro disconnection event.  Real network
+        disconnections or WebSocket crashes in production trigger ``except Exception``,
+        which logs an ``ERROR`` message and raises ``ConnectionError``.
 
         Args:
             symbols: List of native-format symbol strings to subscribe to,
@@ -395,38 +411,50 @@ class BinanceAdapter(ExchangeAdapter):
 
         ws = self._ws_client
 
-        # ── Step 3: stream updates forever (until caller breaks) ────────────
+        # ── Step 3: stream updates forever (until caller breaks or stream closes) ─
 
-        while True:
-            try:
-                payload: dict = await ws.watch_bids_asks(unified_symbols)
-            except StopAsyncIteration:
-                return
-            except Exception as exc:  # pragma: no cover — network path
-                logger.error("binance_ws error %s", exc)
-                raise ConnectionError(
-                    f"Binance bookTicker WS failed: {exc}"
-                ) from exc
+        try:
+            while True:
+                try:
+                    payload: dict = await ws.watch_bids_asks(unified_symbols)
+                except StopAsyncIteration:
+                    # Test harness loop termination signal.  Not a real exchange disconnection.
+                    logger.warning(
+                        "binance_ws stream closed by test harness / iterator for symbols=%s",
+                        len(unified_symbols),
+                    )
+                    return
+                except Exception as exc:  # pragma: no cover — network path
+                    # Real exchange connection failure path in production.
+                    logger.error("binance_ws connection error: %s", exc)
+                    raise ConnectionError(
+                        f"Binance bookTicker WS failed: {exc}"
+                    ) from exc
 
-            recv_ts_ms = time.time_ns() // 1_000_000
+                recv_ts_ms = time.time_ns() // 1_000_000
 
-            for unified, tick in payload.items():
-                native = unified_to_native.get(unified)
-                if native is None:
-                    continue
-                bids = tick.get("bids") or []
-                asks = tick.get("asks") or []
-                if not bids or not asks:
-                    continue
-                best_bid_price = bids[0][0]
-                best_ask_price = asks[0][0]
+                for unified, tick in payload.items():
+                    native = unified_to_native.get(unified)
+                    if native is None:
+                        continue
+                    bids = tick.get("bids") or []
+                    asks = tick.get("asks") or []
+                    if not bids or not asks:
+                        continue
+                    best_bid_price = bids[0][0]
+                    best_ask_price = asks[0][0]
 
-                yield BookTicker(
-                    symbol=native,
-                    bid=Decimal(str(best_bid_price)),
-                    ask=Decimal(str(best_ask_price)),
-                    timestamp_ms=recv_ts_ms,
-                )
+                    yield BookTicker(
+                        symbol=native,
+                        bid=Decimal(str(best_bid_price)),
+                        ask=Decimal(str(best_ask_price)),
+                        timestamp_ms=recv_ts_ms,
+                    )
+        finally:
+            logger.warning(
+                "binance_ws stream exited/terminated for symbols=%s",
+                len(unified_symbols),
+            )
 
     async def get_trading_fees(self, symbol: str) -> TradingFees:
         """Fetch maker/taker fees for a symbol, with in-process caching.

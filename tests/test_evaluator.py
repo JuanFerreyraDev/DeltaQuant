@@ -245,3 +245,91 @@ class TestEvaluatePathAndTriangle:
             assert res.gross_return == Decimal("0")
             assert res.net_return == Decimal("0")
             assert res.is_profitable is False
+
+
+class TestStalenessCheck:
+    """Tests for tick timestamp freshness and max_tick_age_ms threshold filtering."""
+
+    @pytest.fixture
+    def setup_eval_inputs(self):
+        """Build triangle, tickers with timestamps, and fees for staleness testing."""
+        pairs = [
+            TradingPair("BTCUSDT", "BTC", "USDT", Decimal("1000000")),
+            TradingPair("ETHUSDT", "ETH", "USDT", Decimal("1000000")),
+            TradingPair("ETH/BTC", "ETH", "BTC", Decimal("1000000")),
+        ]
+        triangle = generate_triangles(pairs)[0]
+
+        # Base current time: 1,000,000 ms
+        current_time_ms = 1_000_000
+        max_age_ms = 200  # 200 ms threshold
+
+        # Fresh tickers (age 50ms, 100ms, 30ms relative to current_time_ms)
+        tickers = {
+            "BTCUSDT": BookTicker("BTCUSDT", Decimal("49990"), Decimal("50000"), current_time_ms - 50),
+            "ETH/BTC": BookTicker("ETH/BTC", Decimal("0.0499"), Decimal("0.05"), current_time_ms - 100),
+            "ETHUSDT": BookTicker("ETHUSDT", Decimal("2530"), Decimal("2531"), current_time_ms - 30),
+        }
+
+        raw_fees = {
+            s: TradingFees(s, Decimal("0.001"), Decimal("0.001"))
+            for s in ("BTCUSDT", "ETH/BTC", "ETHUSDT")
+        }
+        discounted_fees = {s: apply_bnb_discount(f) for s, f in raw_fees.items()}
+
+        return triangle, tickers, discounted_fees, current_time_ms, max_age_ms
+
+    def test_fresh_ticks_pass_staleness_check(self, setup_eval_inputs) -> None:
+        """Verify fresh ticks (age <= max_tick_age_ms) set is_stale=False."""
+        triangle, tickers, fees, now_ms, max_age = setup_eval_inputs
+
+        results = evaluate_triangle(
+            triangle, tickers, fees, Decimal("0.0010"), now_ms, max_age
+        )
+        best = results[0]
+
+        assert best.is_stale is False
+        assert best.max_age_ms == 100
+        assert best.is_profitable is True
+
+    def test_single_stale_tick_discards_opportunity(self, setup_eval_inputs) -> None:
+        """Verify that a single tick exceeding max_tick_age_ms sets is_stale=True and is_profitable=False.
+
+        Plausible bug tested:
+            A bug where is_profitable only checks net_return > margin without enforcing
+            not is_stale would silently pass a stale profitable opportunity.
+        """
+        triangle, tickers, fees, now_ms, max_age = setup_eval_inputs
+
+        # Make ETH/BTC tick stale (age 250ms > threshold 200ms)
+        tickers["ETH/BTC"] = BookTicker(
+            "ETH/BTC", Decimal("0.0499"), Decimal("0.05"), now_ms - 250
+        )
+
+        results = evaluate_triangle(
+            triangle, tickers, fees, Decimal("0.0010"), now_ms, max_age
+        )
+        best = results[0]
+
+        assert best.net_return == Decimal("1.00972470732306250")  # Math is profitable
+        assert best.is_stale is True
+        assert best.max_age_ms == 250
+        assert best.is_profitable is False  # Discarded due to staleness!
+
+    def test_future_timestamp_clock_skew_flagged_as_stale(self, setup_eval_inputs) -> None:
+        """Verify that a ticker with timestamp in the future (clock skew, age < 0) is flagged stale."""
+        triangle, tickers, fees, now_ms, max_age = setup_eval_inputs
+
+        # Timestamp 100ms in the future
+        tickers["BTCUSDT"] = BookTicker(
+            "BTCUSDT", Decimal("49990"), Decimal("50000"), now_ms + 100
+        )
+
+        results = evaluate_triangle(
+            triangle, tickers, fees, Decimal("0.0010"), now_ms, max_age
+        )
+        best = results[0]
+
+        assert best.is_stale is True
+        assert best.is_profitable is False
+
