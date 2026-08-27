@@ -1,7 +1,7 @@
 # Phase 3: Simulation, Risk, and Persistence — Closeout
 
 ## Status
-**TESTS PASSING / DRY-RUN VALIDATION PENDING** — see §6 for the explicit distinction.
+**TESTS PASSING / DRY-RUN VALIDATION READY** — see §6 for the explicit distinction and deployment instructions.
 
 ---
 
@@ -15,24 +15,18 @@
 | `storage/database.py` | `DatabaseManager`: async SQLite with WAL mode, session lifecycle, PRAGMA configuration |
 | `core/risk.py` | `RiskManager`: position size cap, daily loss limit, concurrency limit, circuit breaker |
 | `core/executor.py` | `Executor`: DRY_RUN parallel dispatch, inventory reconciliation, incident logging |
+| `main.py` | Event loop integration: volume filtering, ticker streaming, evaluation & execution loops |
+| `systemd/deltaquant.service` | User systemd unit file for supervised continuous deployment |
 | `docs/runbooks/reconciliation.md` | Operator runbook: reconciliation mechanism, investigation protocol, resume steps |
 | `docs/adr/ADR-005-sqlite-async-wal-mode.md` | ADR for SQLite WAL mode selection and trade-offs |
 | `docs/adr/ADR-006-risk-limits-and-circuit-breaker.md` | ADR for all Phase 3 risk thresholds and circuit breaker rationale |
-| `docs/calibrations.md` | Updated with 5 new Phase 3 entries (position size, daily loss limit, concurrency limit, circuit breaker threshold, circuit breaker window) |
-
-### Branches created
-
-| Branch | Status |
-|---|---|
-| `feature/f3-sqlite-wal-models` | Committed. Ready for review before merge to develop. |
-| `feature/f3-risk-capital-limits` | Committed. Ready for review before merge to develop. |
-| `feature/f3-executor-parallel-dryrun` | Committed. Ready for review before merge to develop. |
+| `docs/calibrations.md` | Updated with Phase 3 entries (position size, daily loss limit, concurrency limit, circuit breaker) |
 
 ---
 
 ## Test suite
 
-**176 / 176 tests passing** across 11 test modules:
+**179 / 179 tests passing** across 12 test modules:
 
 | Module | Tests |
 |---|---|
@@ -43,6 +37,7 @@
 | `test_evaluator.py` | 11 |
 | `test_fees_bnb_discount.py` | 10 |
 | `test_graph.py` | 45 |
+| `test_main_integration.py` | 3 |
 | `test_reconciliation.py` | 9 |
 | `test_risk.py` | 10 |
 | `test_settings.py` | 40 |
@@ -75,38 +70,71 @@ All Phase 3 thresholds are **initial heuristic starting points**, not empiricall
 
 ---
 
-## New threshold justification conventions (Phase 3+)
+## Systemd Supervised Deployment & Operation
 
-Per `docs/planning/plan_doc_DQ.md` §1 and §9.2 principles:
-- No threshold in this phase was calibrated by looking at what would have made the dry-run "look good" — all parameters were set *before* any live observation.
-- Circuit breaker parameters represent a genuine calibration judgment call (3 incidents / 60 minutes) — the ADR-006 decision record documents exactly why these numbers were chosen and what evidence would warrant revising them.
+### Unit file installation
+To install and start the background user service on Linux Mint / Linux local netbook:
+
+```bash
+# 1. Copy unit file to user systemd directory
+mkdir -p ~/.config/systemd/user/
+cp systemd/deltaquant.service ~/.config/systemd/user/
+
+# 2. Reload systemd manager and enable service
+systemctl --user daemon-reload
+systemctl --user enable deltaquant.service
+
+# 3. Start service and check status
+systemctl --user start deltaquant.service
+systemctl --user status deltaquant.service
+```
+
+### Log monitoring
+Logs are streamed to standard error (captured by `journalctl`) and persisted to `logs/deltaquant.log`:
+
+```bash
+# View live journal logs
+journalctl --user -u deltaquant.service -f
+
+# Grep application log file per runbook instructions
+tail -f logs/deltaquant.log
+grep "profitable_signal_detected" logs/deltaquant.log
+```
+
+### Power Management Note (Linux Mint / Netbook)
+Because the observation period requires 72 hours of uninterrupted execution:
+- Ensure laptop lid closure action is set to **"Do Nothing"** or **"Turn off display"** (not Suspend/Sleep).
+- Disable automatic system suspend on AC power in Linux Mint Power Management settings (`cinnamon-settings power`).
 
 ---
 
-## ⚠️ DRY_RUN Validation Status — NOT COMPLETED
+## Operational Progress Queries (Observation Period Telemetry)
 
-> **Tests passing ≠ Dry-run validated. These are not the same claim.**
+To inspect total evaluations, profitable signal count, and risk status during the 72-hour `DRY_RUN` observation period without interrupting the running process, run:
+
+```bash
+# Total triangle evaluations count so far
+sqlite3 deltaquant.db "SELECT metric_value AS evaluations_count, datetime(timestamp_ms/1000, 'unixepoch', 'localtime') AS timestamp FROM metrics WHERE metric_name = 'evaluations_count' ORDER BY id DESC LIMIT 1;"
+
+# Full operational heartbeat and telemetry snapshot
+sqlite3 deltaquant.db "SELECT metric_name, metric_value, datetime(timestamp_ms/1000, 'unixepoch', 'localtime') AS timestamp FROM metrics WHERE metric_name IN ('evaluations_count', 'profitable_signals_count', 'executions_count', 'risk_is_paused') ORDER BY id DESC LIMIT 4;"
+```
+
+---
+
+## ⚠️ DRY_RUN Validation Status
 
 Phase 3 dry-run validation is a **real elapsed-time requirement** per the Technical Plan §8 and the roadmap (§5, Fase 3):
 
 > *"Correr en DRY_RUN varios días, revisar métricas de fill rate teórico y PnL neto de comisiones antes de avanzar."*
 
-**What must happen before Phase 3 is considered validated:**
-1. All Phase 3 branches must be merged to `develop`.
-2. The bot must run with `DRY_RUN=True` for a minimum of several consecutive days.
-3. The following must be collected and reviewed:
-   - Frequency of profitability signals (triangle evaluation → `is_profitable=True`).
-   - Theoretical fill rate (simulated FOK completion rate).
-   - Simulated net PnL after commission deduction across all evaluated opportunities.
-   - Incident rate (how often reconciliation events would have been triggered).
-4. Based on these observations, the following calibrations must be revisited before Phase 4:
-   - `MAX_TICK_AGE_MS` (empirical P95/P99 latency data — deferred from Phase 2).
-   - `SAFETY_MARGIN` (actual slippage distribution vs. the 10 bps buffer assumption).
-   - All Phase 3 risk thresholds (see table above).
+**Observation protocol (72-hour run):**
+1. Ensure the systemd service is active (`systemctl --user status deltaquant`).
+2. Run continuously for 72 hours.
+3. Periodically review evaluation progress and logs.
+4. Review collected telemetry data at hour 72 to calibrate `MAX_TICK_AGE_MS`, `SAFETY_MARGIN`, and risk limits before proceeding to Phase 4.
 
-**`develop` will not be tagged `v0.3.0-fase3-dryrun` and will not merge to `main` until the DRY_RUN observation period is complete and documented.**
-
-The specific dry-run observation plan, given the current local/dev environment (no VPS yet — Phase 5), will be agreed with the operator before execution starts.
+**`develop` will be tagged `v0.3.0-fase3-dryrun` upon completion of the 72h observation period.**
 
 ---
 
@@ -115,5 +143,4 @@ The specific dry-run observation plan, given the current local/dev environment (
 - `interfaces/telegram_bot.py`: `/status`, `/kill`, `/resume`, `/pnl` commands.
 - Redis control-plane (`storage/redis_client.py`): `TRADING_ENABLED` kill switch.
 - Telegram incident alerts.
-- `main.py` event loop integration wiring all Phase 3 modules together.
 - UTC midnight reset for `DAILY_LOSS_LIMIT_USDT`: `RiskManager.reset_daily_pnl()` exists but nothing calls it automatically yet (no scheduler/cron wiring). See ADR-006 trade-offs section.

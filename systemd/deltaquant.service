@@ -1,0 +1,17 @@
+[Unit]
+Description=DeltaQuant Triangular Arbitrage Bot (DRY_RUN 72h Observation)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/juan/Desktop/Projects/DeltaQuant
+ExecStart=/home/juan/Desktop/Projects/DeltaQuant/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10s
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

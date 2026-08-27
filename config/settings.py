@@ -98,6 +98,16 @@ class Settings(BaseSettings):
         gt=0,
         description="Max book-ticker age in ms before the price is stale.",
     )
+    PAIR_REFRESH_INTERVAL_SECONDS: int = Field(
+        default=3600,
+        gt=0,
+        description="Interval in seconds for periodic 24h pair/volume graph refresh.",
+    )
+    METRICS_PERSIST_INTERVAL_SECONDS: int = Field(
+        default=60,
+        gt=0,
+        description="Interval in seconds for persisting system and evaluation metrics.",
+    )
 
     # ── Risk limits ───────────────────────────────────────────────────────────
     MAX_POSITION_USDT: Decimal = Field(
