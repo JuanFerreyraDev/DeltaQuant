@@ -335,6 +335,8 @@ class TestReconciliationArithmetic:
         )
         assert result.status == "FAILED_LEG_0"
         assert result.legs_filled == 0
+        assert result.actual_net_return == Decimal("1.0")
+        assert executor.risk_manager.daily_pnl_usdt == Decimal("0")
         assert executor.risk_manager._incident_timestamps_ms == []
 
 
