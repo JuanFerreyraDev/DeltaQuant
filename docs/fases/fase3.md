@@ -26,7 +26,7 @@
 
 ## Test suite
 
-**180 / 180 tests passing** across 12 test modules:
+**181 / 181 tests passing** across 12 test modules:
 
 | Module | Tests |
 |---|---|
@@ -37,7 +37,7 @@
 | `test_evaluator.py` | 11 |
 | `test_fees_bnb_discount.py` | 10 |
 | `test_graph.py` | 45 |
-| `test_main_integration.py` | 4 |
+| `test_main_integration.py` | 5 |
 | `test_reconciliation.py` | 9 |
 | `test_risk.py` | 10 |
 | `test_settings.py` | 40 |
