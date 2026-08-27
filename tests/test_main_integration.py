@@ -181,3 +181,78 @@ async def test_metrics_persist_loop_saves_rows(
 
     eval_metric = next(m for m in metrics if m.metric_name == "evaluations_count")
     assert eval_metric.metric_value == 42.0
+
+
+@pytest.mark.asyncio
+async def test_resubscription_on_symbol_change(
+    db_manager, risk_manager, executor, test_settings
+):
+    """Simulating pair refresh with volume changes triggers WS resubscription without ending the WS loop."""
+    batch_1 = [
+        {"symbol": "BTC/USDT", "quoteVolume": "10000000", "last": "50000"},
+        {"symbol": "ETH/USDT", "quoteVolume": "5000000", "last": "3000"},
+        {"symbol": "ETH/BTC", "quoteVolume": "2000", "last": "0.06"},
+    ]
+    batch_2 = [
+        {"symbol": "BTC/USDT", "quoteVolume": "10000000", "last": "50000"},
+        {"symbol": "SOL/USDT", "quoteVolume": "8000000", "last": "150"},
+        {"symbol": "SOL/BTC", "quoteVolume": "3000", "last": "0.003"},
+    ]
+
+    fetch_call_count = 0
+
+    async def mock_fetch_24h():
+        nonlocal fetch_call_count
+        fetch_call_count += 1
+        return batch_1 if fetch_call_count == 1 else batch_2
+
+    subscribed_calls = []
+
+    async def mock_subscribe(symbols):
+        subscribed_calls.append(list(symbols))
+        # Yield one tick then wait until cancelled or resubscribed
+        yield BookTicker(symbols[0], Decimal("100"), Decimal("101"), int(time.time() * 1000))
+        while True:
+            await asyncio.sleep(10)
+
+    adapter = AsyncMock()
+    adapter.fetch_tickers_24h = AsyncMock(side_effect=mock_fetch_24h)
+    adapter.subscribe_book_ticker = MagicMock(side_effect=mock_subscribe)
+    adapter.get_trading_fees = AsyncMock(
+        side_effect=lambda s: TradingFees(s, Decimal("0.00075"), Decimal("0.00075"))
+    )
+
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+    )
+
+    start_task = asyncio.create_task(orchestrator.start())
+    await asyncio.sleep(0.1)
+
+    # Verify first subscription cycle
+    assert len(subscribed_calls) == 1
+    assert set(subscribed_calls[0]) == {"ETH/BTC", "ETHUSDT", "BTCUSDT"}
+
+    # Trigger second refresh cycle with batch_2
+    await orchestrator.refresh_triangles()
+    await asyncio.sleep(0.1)
+
+    # Verify second subscription cycle occurred with NEW symbols
+    assert len(subscribed_calls) == 2
+    assert set(subscribed_calls[1]) == {"SOL/BTC", "SOLUSDT", "BTCUSDT"}
+
+    # Assert that the WS loop task did NOT crash or terminate
+    assert orchestrator._ws_task is not None
+    assert not orchestrator._ws_task.done()
+
+    # Clean shutdown
+    await orchestrator.stop()
+    start_task.cancel()
+    try:
+        await start_task
+    except asyncio.CancelledError:
+        pass
