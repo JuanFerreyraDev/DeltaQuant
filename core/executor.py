@@ -37,7 +37,19 @@ from storage.models import Incident, Trade
 
 @dataclass(frozen=True)
 class ExecutionResult:
-    """Dataclass encapsulating the outcome of a triangle execution attempt."""
+    """Dataclass encapsulating the outcome of a triangle execution attempt.
+
+    Attributes:
+        triangle_id: Unique execution identifier string.
+        status: Execution status string.
+        expected_net_return: Theoretical return multiplier from evaluator.
+        actual_net_return: Realized return multiplier (1.0 = breakeven / no loss,
+            >1.0 = profit, <1.0 = loss).
+        execution_duration_ms: Total duration in milliseconds.
+        legs_filled: Number of legs successfully filled (0, 1, 2, or 3).
+        error_message: Optional error message string if execution failed.
+        incident_id: Optional database incident ID if reconciliation was triggered.
+    """
 
     triangle_id: str
     status: str  # "COMPLETED", "FAILED_RECONCILED", "REJECTED_RISK", "SIMULATED", "FAILED_LEG_0"
@@ -202,7 +214,7 @@ class Executor:
                 triangle_id=triangle_id,
                 status="FAILED_LEG_0",
                 expected_net_return=expected_net_return,
-                actual_net_return=Decimal("0"),
+                actual_net_return=Decimal("1.0"),
                 execution_duration_ms=duration_ms,
                 legs_filled=0,
                 error_message=(
