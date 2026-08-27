@@ -157,6 +157,21 @@ class TestRiskManagerCircuitBreaker:
         ok, _ = risk_manager.can_execute(Decimal("10"), current_time_ms=t_future)
         assert ok is True
 
+    def test_resume_clears_incident_history_window(self, risk_manager):
+        """Calling resume() clears incident window so next can_execute() does not re-trigger."""
+        t0 = 1700000000000
+        risk_manager.record_incident(t0)
+        risk_manager.record_incident(t0 + 1000)
+        risk_manager.record_incident(t0 + 2000)
+        assert risk_manager.is_paused is True
+
+        risk_manager.resume()
+        assert risk_manager.is_paused is False
+
+        ok, reason = risk_manager.can_execute(Decimal("10"), current_time_ms=t0 + 3000)
+        assert ok is True
+        assert reason is None
+
 
 class TestRiskManagerDiagnostics:
     """Status diagnostic snapshot tests."""
