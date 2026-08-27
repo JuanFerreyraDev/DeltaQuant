@@ -32,7 +32,7 @@
 
 ## Test suite
 
-**173 / 173 tests passing** across 11 test modules:
+**176 / 176 tests passing** across 11 test modules:
 
 | Module | Tests |
 |---|---|
@@ -43,8 +43,8 @@
 | `test_evaluator.py` | 11 |
 | `test_fees_bnb_discount.py` | 10 |
 | `test_graph.py` | 45 |
-| `test_reconciliation.py` | 7 |
-| `test_risk.py` | 9 |
+| `test_reconciliation.py` | 9 |
+| `test_risk.py` | 10 |
 | `test_settings.py` | 40 |
 | `test_symbol_helpers.py` | 12 |
 
@@ -116,3 +116,4 @@ The specific dry-run observation plan, given the current local/dev environment (
 - Redis control-plane (`storage/redis_client.py`): `TRADING_ENABLED` kill switch.
 - Telegram incident alerts.
 - `main.py` event loop integration wiring all Phase 3 modules together.
+- UTC midnight reset for `DAILY_LOSS_LIMIT_USDT`: `RiskManager.reset_daily_pnl()` exists but nothing calls it automatically yet (no scheduler/cron wiring). See ADR-006 trade-offs section.
