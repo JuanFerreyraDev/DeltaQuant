@@ -7,6 +7,7 @@ evaluator, and execution engine into a continuous async event loop.
 import asyncio
 import json
 import logging
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -95,6 +96,7 @@ class Orchestrator:
         self.executions_count: int = 0
 
         self._running: bool = False
+        self._resubscribe_event: asyncio.Event = asyncio.Event()
         self._ws_task: Optional[asyncio.Task] = None
         self._refresh_task: Optional[asyncio.Task] = None
         self._metrics_task: Optional[asyncio.Task] = None
@@ -135,9 +137,9 @@ class Orchestrator:
             len(new_symbols),
         )
 
-        if self._running and old_subscribed != new_symbols and self._ws_task:
-            logger.info("symbols_changed_restarting_ws_stream")
-            self._ws_task.cancel()
+        if self._running and old_subscribed != new_symbols:
+            logger.info("symbols_changed_triggering_resubscription")
+            self._resubscribe_event.set()
 
     async def _periodic_refresh_loop(self) -> None:
         """Periodically trigger volume/triangle refresh."""
@@ -200,108 +202,169 @@ class Orchestrator:
             except Exception as exc:
                 logger.error("metrics_persist_error err={}", exc)
 
+    async def _process_tick(self, tick: BookTicker) -> None:
+        """Process a single BookTicker update."""
+        self.cached_tickers[tick.symbol] = tick
+        triangles = self.symbol_to_triangles.get(tick.symbol, [])
+        now_ms = int(time.time() * 1000)
+
+        for triangle in triangles:
+            p_ab, p_bc, p_ca = triangle.pair_ab, triangle.pair_bc, triangle.pair_ca
+            if (
+                p_ab not in self.cached_tickers
+                or p_bc not in self.cached_tickers
+                or p_ca not in self.cached_tickers
+            ):
+                continue
+            if (
+                p_ab not in self.fee_rates
+                or p_bc not in self.fee_rates
+                or p_ca not in self.fee_rates
+            ):
+                continue
+
+            results = evaluate_triangle(
+                triangle=triangle,
+                tickers=self.cached_tickers,
+                fee_rates=self.fee_rates,
+                safety_margin=self.settings.SAFETY_MARGIN,
+                current_time_ms=now_ms,
+                max_tick_age_ms=self.settings.MAX_TICK_AGE_MS,
+            )
+            self.evaluations_count += 2
+
+            for res in results:
+                if res.is_profitable:
+                    self.profitable_signals_count += 1
+                    logger.info(
+                        "profitable_signal_detected triangle={} net_return={} max_age_ms={}",
+                        res.triangle,
+                        res.net_return,
+                        res.max_age_ms,
+                    )
+                    can_exec, reason = self.risk_manager.can_execute(
+                        self.settings.MAX_POSITION_USDT, current_time_ms=now_ms
+                    )
+                    if can_exec:
+                        self.executions_count += 1
+                        logger.info(
+                            "executing_triangle triangle={} path={}",
+                            res.triangle,
+                            res.path,
+                        )
+                        # Note: Execution runs inline here. In DRY_RUN mode this simulation
+                        # is instantaneous. In Phase 5 live trading, order dispatch will be
+                        # handled asynchronously via asyncio.create_task to avoid blocking
+                        # top-of-book ticker ingestion.
+                        await self.executor.execute_triangle(
+                            triangle=triangle,
+                            pair_symbols=res.pair_symbols,
+                            position_usdt=self.settings.MAX_POSITION_USDT,
+                            expected_net_return=res.net_return,
+                        )
+                    else:
+                        logger.info(
+                            "execution_blocked_by_risk reason='{}'", reason
+                        )
+
     async def _ws_ticker_loop(self) -> None:
         """Stream book tickers and run real-time triangle evaluations."""
         while self._running:
             symbols = list(self.subscribed_symbols)
             if not symbols:
                 logger.warning("no_symbols_subscribed_waiting_refresh")
-                await asyncio.sleep(5)
+                try:
+                    await asyncio.wait_for(self._resubscribe_event.wait(), timeout=5.0)
+                    self._resubscribe_event.clear()
+                except asyncio.TimeoutError:
+                    pass
                 continue
 
-            try:
-                async for tick in self.adapter.subscribe_book_ticker(symbols):
-                    if not self._running:
+            self._resubscribe_event.clear()
+            stream = self.adapter.subscribe_book_ticker(symbols)
+            ticker_iter = stream.__aiter__()
+
+            while self._running and not self._resubscribe_event.is_set():
+                next_tick_task = asyncio.create_task(anext(ticker_iter))
+                event_task = asyncio.create_task(self._resubscribe_event.wait())
+
+                done, pending = await asyncio.wait(
+                    [next_tick_task, event_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for p in pending:
+                    p.cancel()
+                    try:
+                        await p
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
+                    except Exception:
+                        pass
+
+                if event_task in done:
+                    logger.info("symbols_changed_restarting_ws_stream")
+                    if hasattr(ticker_iter, "aclose"):
+                        try:
+                            await ticker_iter.aclose()
+                        except Exception:
+                            pass
+                    break
+
+                if next_tick_task in done:
+                    try:
+                        tick = next_tick_task.result()
+                    except StopAsyncIteration:
+                        logger.warning("ws_stream_ended_normally")
+                        break
+                    except Exception as exc:
+                        logger.error("ws_ticker_stream_error err={}", exc)
+                        await asyncio.sleep(2)
                         break
 
-                    self.cached_tickers[tick.symbol] = tick
-                    triangles = self.symbol_to_triangles.get(tick.symbol, [])
-                    now_ms = int(time.time() * 1000)
-
-                    for triangle in triangles:
-                        p_ab, p_bc, p_ca = triangle.pair_ab, triangle.pair_bc, triangle.pair_ca
-                        if (
-                            p_ab not in self.cached_tickers
-                            or p_bc not in self.cached_tickers
-                            or p_ca not in self.cached_tickers
-                        ):
-                            continue
-                        if (
-                            p_ab not in self.fee_rates
-                            or p_bc not in self.fee_rates
-                            or p_ca not in self.fee_rates
-                        ):
-                            continue
-
-                        results = evaluate_triangle(
-                            triangle=triangle,
-                            tickers=self.cached_tickers,
-                            fee_rates=self.fee_rates,
-                            safety_margin=self.settings.SAFETY_MARGIN,
-                            current_time_ms=now_ms,
-                            max_tick_age_ms=self.settings.MAX_TICK_AGE_MS,
-                        )
-                        self.evaluations_count += 2
-
-                        for res in results:
-                            if res.is_profitable:
-                                self.profitable_signals_count += 1
-                                logger.info(
-                                    "profitable_signal_detected triangle={} net_return={} max_age_ms={}",
-                                    res.triangle,
-                                    res.net_return,
-                                    res.max_age_ms,
-                                )
-                                can_exec, reason = self.risk_manager.can_execute(
-                                    self.settings.MAX_POSITION_USDT, current_time_ms=now_ms
-                                )
-                                if can_exec:
-                                    self.executions_count += 1
-                                    logger.info(
-                                        "executing_triangle triangle={} path={}",
-                                        res.triangle,
-                                        res.path,
-                                    )
-                                    await self.executor.execute_triangle(
-                                        triangle=triangle,
-                                        pair_symbols=res.pair_symbols,
-                                        position_usdt=self.settings.MAX_POSITION_USDT,
-                                        expected_net_return=res.net_return,
-                                    )
-                                else:
-                                    logger.info(
-                                        "execution_blocked_by_risk reason='{}'", reason
-                                    )
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error("ws_ticker_loop_error err={}", exc)
-                if not self._running:
-                    break
-                await asyncio.sleep(2)
+                    await self._process_tick(tick)
 
     async def start(self) -> None:
-        """Start orchestrator tasks and run main event loop."""
+        """Start orchestrator tasks and monitor for completion / failures."""
         self._running = True
         await self.refresh_triangles()
 
-        self._refresh_task = asyncio.create_task(self._periodic_refresh_loop())
-        self._metrics_task = asyncio.create_task(self._periodic_metrics_loop())
+        self._refresh_task = asyncio.create_task(
+            self._periodic_refresh_loop(), name="refresh_loop"
+        )
+        self._metrics_task = asyncio.create_task(
+            self._periodic_metrics_loop(), name="metrics_loop"
+        )
+        self._ws_task = asyncio.create_task(
+            self._ws_ticker_loop(), name="ws_ticker_loop"
+        )
 
         try:
-            await self._ws_ticker_loop()
+            await asyncio.gather(
+                self._refresh_task,
+                self._metrics_task,
+                self._ws_task,
+            )
+        except asyncio.CancelledError:
+            logger.info("orchestrator_gather_cancelled")
+            raise
+        except Exception as exc:
+            logger.error("orchestrator_task_failed err={}", exc)
+            raise
         finally:
             await self.stop()
 
     async def stop(self) -> None:
         """Stop all background tasks cleanly."""
         self._running = False
-        if self._refresh_task:
-            self._refresh_task.cancel()
-        if self._metrics_task:
-            self._metrics_task.cancel()
-        if self._ws_task:
-            self._ws_task.cancel()
+        self._resubscribe_event.set()
+        for task in (self._refresh_task, self._metrics_task, self._ws_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
 
 async def async_main() -> None:
@@ -330,12 +393,38 @@ async def async_main() -> None:
         settings=settings,
     )
 
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _on_signal(sig_name: str) -> None:
+        logger.info("received_signal signal={}", sig_name)
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal, sig.name)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    async def _wait_for_stop() -> None:
+        await stop_event.wait()
+        logger.info("stopping_orchestrator_from_signal")
+        await orchestrator.stop()
+
+    stop_task = asyncio.create_task(_wait_for_stop())
+
     try:
         await orchestrator.start()
     except Exception as exc:
         logger.error("main_loop_fatal_crash error='{}'", exc, exc_info=True)
         raise
     finally:
+        stop_task.cancel()
+        try:
+            await stop_task
+        except asyncio.CancelledError:
+            pass
+        await orchestrator.stop()
         await db_manager.close()
 
 
