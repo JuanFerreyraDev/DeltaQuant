@@ -120,6 +120,8 @@ print(risk_manager.is_paused)   # → False
 print(risk_manager.pause_reason) # → None
 ```
 
+> **Note**: Calling `risk_manager.resume()` clears the incident window history (`_incident_timestamps_ms`). This resets the circuit breaker counter to zero so that subsequent trades within the 60-minute window will not re-pause the bot without new incidents occurring.
+
 > **Note**: In Phase 4, this resume step will be replaced by the Telegram `/resume` command. Until then, direct Python shell access is required.
 
 ---

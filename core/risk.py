@@ -175,10 +175,19 @@ class RiskManager:
         logger.error("risk_manager_paused reason='{}'", reason)
 
     def resume(self) -> None:
-        """Resume trading operations after manual intervention."""
+        """Resume trading operations after manual intervention.
+
+        Also clears the incident history window (_incident_timestamps_ms) because
+        the operator precondition for resuming is that the root cause has been
+        investigated and resolved. If not cleared, the circuit breaker would
+        immediately re-trigger on the next can_execute() call within the window
+        without any new incidents.
+        """
+        cleared_count = len(self._incident_timestamps_ms)
+        self._incident_timestamps_ms.clear()
         self._is_paused = False
         self._pause_reason = None
-        logger.info("risk_manager_resumed")
+        logger.info("risk_manager_resumed cleared_incidents={}", cleared_count)
 
     def reset_daily_pnl(self) -> None:
         """Reset daily cumulative PnL to 0.0 USDT (used at UTC day rollover)."""
