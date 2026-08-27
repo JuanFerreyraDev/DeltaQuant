@@ -1,7 +1,7 @@
 """Triangular arbitrage execution and inventory reconciliation engine for DeltaQuant.
 
 Handles:
-    - Parallel 3-leg order dispatch via ``asyncio.gather``.
+    - Parallel 3-leg order dispatch via ``asyncio.gather`` (planned for Phase 5 — DRY_RUN mode in this phase simulates leg outcomes via simulated_leg_failures).
     - Pre-execution safety filtering via ``RiskManager``.
     - Simulated order placement and fill evaluation in ``DRY_RUN`` mode.
     - Post-failure inventory reconciliation and emergency market liquidation.
