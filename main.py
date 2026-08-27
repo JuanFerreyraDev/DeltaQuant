@@ -269,60 +269,70 @@ class Orchestrator:
 
     async def _ws_ticker_loop(self) -> None:
         """Stream book tickers and run real-time triangle evaluations."""
-        while self._running:
-            symbols = list(self.subscribed_symbols)
-            if not symbols:
-                logger.warning("no_symbols_subscribed_waiting_refresh")
-                try:
-                    await asyncio.wait_for(self._resubscribe_event.wait(), timeout=5.0)
-                    self._resubscribe_event.clear()
-                except asyncio.TimeoutError:
-                    pass
-                continue
-
-            self._resubscribe_event.clear()
-            stream = self.adapter.subscribe_book_ticker(symbols)
-            ticker_iter = stream.__aiter__()
-
-            while self._running and not self._resubscribe_event.is_set():
-                next_tick_task = asyncio.create_task(anext(ticker_iter))
-                event_task = asyncio.create_task(self._resubscribe_event.wait())
-
-                done, pending = await asyncio.wait(
-                    [next_tick_task, event_task],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                for p in pending:
-                    p.cancel()
+        try:
+            while self._running:
+                symbols = list(self.subscribed_symbols)
+                if not symbols:
+                    logger.warning("no_symbols_subscribed_waiting_refresh")
                     try:
-                        await p
-                    except (asyncio.CancelledError, StopAsyncIteration):
+                        await asyncio.wait_for(self._resubscribe_event.wait(), timeout=5.0)
+                        self._resubscribe_event.clear()
+                    except asyncio.TimeoutError:
                         pass
-                    except Exception:
-                        pass
+                    except asyncio.CancelledError:
+                        break
+                    continue
 
-                if event_task in done:
-                    logger.info("symbols_changed_restarting_ws_stream")
-                    if hasattr(ticker_iter, "aclose"):
+                self._resubscribe_event.clear()
+                stream = self.adapter.subscribe_book_ticker(symbols)
+                ticker_iter = stream.__aiter__()
+
+                while self._running and not self._resubscribe_event.is_set():
+                    next_tick_task: Optional[asyncio.Task] = None
+                    event_task: Optional[asyncio.Task] = None
+                    try:
+                        next_tick_task = asyncio.create_task(anext(ticker_iter))
+                        event_task = asyncio.create_task(self._resubscribe_event.wait())
+
+                        done, pending = await asyncio.wait(
+                            [next_tick_task, event_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for p in (next_tick_task, event_task):
+                            if p is not None and not p.done():
+                                p.cancel()
+                                try:
+                                    await p
+                                except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                                    pass
+
+                    if event_task in done:
+                        logger.info("symbols_changed_restarting_ws_stream")
+                        if hasattr(ticker_iter, "aclose"):
+                            try:
+                                await ticker_iter.aclose()
+                            except Exception:
+                                pass
+                        break
+
+                    if next_tick_task in done:
                         try:
-                            await ticker_iter.aclose()
-                        except Exception:
-                            pass
-                    break
+                            tick = next_tick_task.result()
+                        except StopAsyncIteration:
+                            logger.warning("ws_stream_ended_normally")
+                            break
+                        except Exception as exc:
+                            logger.error("ws_ticker_stream_error err={}", exc)
+                            await asyncio.sleep(2)
+                            break
 
-                if next_tick_task in done:
-                    try:
-                        tick = next_tick_task.result()
-                    except StopAsyncIteration:
-                        logger.warning("ws_stream_ended_normally")
-                        break
-                    except Exception as exc:
-                        logger.error("ws_ticker_stream_error err={}", exc)
-                        await asyncio.sleep(2)
-                        break
-
-                    await self._process_tick(tick)
+                        await self._process_tick(tick)
+        except asyncio.CancelledError:
+            logger.info("ws_ticker_loop_cancelled_cleanly")
+        except Exception as exc:
+            logger.error("ws_ticker_loop_fatal_error err={}", exc)
+            raise
 
     async def start(self) -> None:
         """Start orchestrator tasks and monitor for completion / failures."""

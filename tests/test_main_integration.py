@@ -256,3 +256,48 @@ async def test_resubscription_on_symbol_change(
         await start_task
     except asyncio.CancelledError:
         pass
+
+
+@pytest.mark.asyncio
+async def test_ws_loop_cancellation_during_tick_wait_is_clean(
+    db_manager, risk_manager, executor, test_settings
+):
+    """Cancelling the WS loop while waiting for a tick completes cleanly without CancelledError or pending task leaks."""
+    batch = [
+        {"symbol": "BTC/USDT", "quoteVolume": "10000000", "last": "50000"},
+        {"symbol": "ETH/USDT", "quoteVolume": "5000000", "last": "3000"},
+        {"symbol": "ETH/BTC", "quoteVolume": "2000", "last": "0.06"},
+    ]
+
+    async def mock_subscribe(symbols):
+        # Never yields ticks; stays suspended in sleep so tick-wait is active
+        await asyncio.sleep(100)
+        yield BookTicker(symbols[0], Decimal("100"), Decimal("101"), int(time.time() * 1000))
+
+    adapter = AsyncMock()
+    adapter.fetch_tickers_24h = AsyncMock(return_value=batch)
+    adapter.subscribe_book_ticker = MagicMock(side_effect=mock_subscribe)
+    adapter.get_trading_fees = AsyncMock(
+        side_effect=lambda s: TradingFees(s, Decimal("0.00075"), Decimal("0.00075"))
+    )
+
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+    )
+
+    start_task = asyncio.create_task(orchestrator.start())
+    await asyncio.sleep(0.1)
+
+    # Stop orchestrator while tick wait is in flight
+    await orchestrator.stop()
+
+    # start_task must finish cleanly without raising CancelledError out of gather/start
+    await start_task
+    assert start_task.done()
+    assert not start_task.cancelled()
+    assert start_task.exception() is None
+
