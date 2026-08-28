@@ -7,7 +7,7 @@ pydantic-settings==2.3.1
 ccxt>=4.5.76          # REST + ccxt.pro (WebSocket superset) for bookTicker stream
 
 # ── Async event loop ──────────────────────────────────────────────────────────
-uvloop==0.19.0
+uvloop==0.22.1
 
 # ── Control-plane cache ───────────────────────────────────────────────────────
 redis==5.0.4

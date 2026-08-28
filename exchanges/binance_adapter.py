@@ -395,8 +395,6 @@ class BinanceAdapter(ExchangeAdapter):
         if self._ws_client is None:
             self._ws_client = ccxt_pro.binance(
                 {
-                    "apiKey": self._settings.BINANCE_API_KEY,
-                    "secret": self._settings.BINANCE_API_SECRET,
                     "enableRateLimit": True,
                     "options": {
                         "defaultType": "spot",
@@ -437,12 +435,21 @@ class BinanceAdapter(ExchangeAdapter):
                     native = unified_to_native.get(unified)
                     if native is None:
                         continue
-                    bids = tick.get("bids") or []
-                    asks = tick.get("asks") or []
-                    if not bids or not asks:
-                        continue
-                    best_bid_price = bids[0][0]
-                    best_ask_price = asks[0][0]
+
+                    # ccxt >=4.5 returns flat 'bid'/'ask' floats from
+                    # watch_bids_asks; earlier versions used nested
+                    # 'bids'/'asks' arrays.  Read flat fields first,
+                    # fall back to nested arrays for test compatibility.
+                    best_bid_price = tick.get("bid")
+                    best_ask_price = tick.get("ask")
+
+                    if best_bid_price is None or best_ask_price is None:
+                        bids = tick.get("bids") or []
+                        asks = tick.get("asks") or []
+                        if not bids or not asks:
+                            continue
+                        best_bid_price = bids[0][0]
+                        best_ask_price = asks[0][0]
 
                     yield BookTicker(
                         symbol=native,
@@ -455,6 +462,15 @@ class BinanceAdapter(ExchangeAdapter):
                 "binance_ws stream exited/terminated for symbols=%s",
                 len(unified_symbols),
             )
+            # Reset ws client so next subscribe_book_ticker call creates
+            # a fresh ccxt.pro instance instead of reusing a potentially
+            # dirty connection after a server-side disconnect (code 1006).
+            if self._ws_client is not None:
+                try:
+                    await self._ws_client.close()
+                except Exception:
+                    pass
+                self._ws_client = None
 
     async def get_trading_fees(self, symbol: str) -> TradingFees:
         """Fetch maker/taker fees for a symbol, with in-process caching.
