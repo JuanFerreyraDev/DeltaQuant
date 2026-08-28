@@ -12,6 +12,7 @@ import sys
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
+from decimal import Decimal
 
 from loguru import logger
 
@@ -22,7 +23,7 @@ from core.graph import Triangle, filter_pairs_by_volume, generate_triangles
 from core.risk import RiskManager
 from exchanges.base import BookTicker, ExchangeAdapter, TradingFees
 from exchanges.binance_adapter import BinanceAdapter
-from exchanges.fees import get_effective_fees
+from exchanges.fees import apply_bnb_discount, get_effective_fees
 from storage.database import DatabaseManager
 from storage.models import Metric
 
@@ -108,14 +109,19 @@ class Orchestrator:
         pairs = filter_pairs_by_volume(raw_tickers, self.settings.MIN_VOLUME_USDT)
         triangles = generate_triangles(pairs)
 
-        # Pre-fetch fee rates for all symbols present in filtered pairs
-        for pair in pairs:
-            if pair.symbol not in self.fee_rates:
+        # Pre-fetch fee rates concurrently for all new symbols present in filtered pairs
+        symbols_to_fetch = [p.symbol for p in pairs if p.symbol not in self.fee_rates]
+        if symbols_to_fetch:
+            async def _fetch_one_fee(sym: str) -> None:
                 try:
-                    fees = await get_effective_fees(self.adapter, pair.symbol)
-                    self.fee_rates[pair.symbol] = fees
+                    fees = await get_effective_fees(self.adapter, sym)
+                    self.fee_rates[sym] = fees
                 except Exception as exc:
-                    logger.warning("fee_fetch_failed symbol={} err={}", pair.symbol, exc)
+                    logger.warning("fee_fetch_failed symbol={} err={} (using default fee fallback)", sym, exc)
+                    default_raw = TradingFees(sym, Decimal("0.001"), Decimal("0.001"))
+                    self.fee_rates[sym] = apply_bnb_discount(default_raw) if self.settings.USE_BNB_FEE_DISCOUNT else default_raw
+
+            await asyncio.gather(*[_fetch_one_fee(sym) for sym in symbols_to_fetch])
 
         new_symbol_to_triangles: Dict[str, List[Triangle]] = defaultdict(list)
         new_symbols: Set[str] = set()
@@ -137,7 +143,7 @@ class Orchestrator:
             len(new_symbols),
         )
 
-        if self._running and old_subscribed != new_symbols:
+        if self._running and old_subscribed and old_subscribed != new_symbols:
             logger.info("symbols_changed_triggering_resubscription")
             self._resubscribe_event.set()
 

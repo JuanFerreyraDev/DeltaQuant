@@ -273,6 +273,9 @@ class TestSubscribeBookTicker:
             async def watch_bids_asks(self, sl):
                 raise StopAsyncIteration
 
+            async def close(self):
+                pass
+
         orig_binance = ccxt_pro.binance
         try:
             ccxt_pro.binance = FakeWsClient
@@ -282,7 +285,9 @@ class TestSubscribeBookTicker:
             assert constructed["n"] == 1, (
                 f"ccxt.pro.binance should be called exactly once, got {constructed['n']}"
             )
-            assert adapter._ws_client is not None
+            # After stream exit, _ws_client is reset to None for clean
+            # reconnection on the next subscribe_book_ticker call.
+            assert adapter._ws_client is None
         finally:
             ccxt_pro.binance = orig_binance
 
