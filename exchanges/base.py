@@ -256,3 +256,7 @@ class ExchangeAdapter(ABC):
                 ``quantity``/``price`` violate exchange filter rules.
             PermissionError: If the API key does not have trading permissions.
         """
+
+    async def close(self) -> None:
+        """Release underlying exchange connections and resources."""
+        pass

@@ -13,6 +13,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set
 from decimal import Decimal
+import aiohttp
 
 from loguru import logger
 
@@ -412,6 +413,29 @@ async def async_main() -> None:
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
+    def _handle_loop_exception(loop_inst: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        if isinstance(
+            exc,
+            (
+                aiohttp.ClientConnectionResetError,
+                ConnectionResetError,
+                asyncio.CancelledError,
+            ),
+        ):
+            logger.debug("background_transport_exception_suppressed err='{}'", exc)
+            return
+        if (
+            "Cannot write to closing transport" in msg
+            or "ClientWebSocketResponse.receive" in msg
+        ):
+            logger.debug("background_websocket_teardown_suppressed msg='{}'", msg)
+            return
+        loop_inst.default_exception_handler(context)
+
+    loop.set_exception_handler(_handle_loop_exception)
+
     def _on_signal(sig_name: str) -> None:
         logger.info("received_signal signal={}", sig_name)
         stop_event.set()
@@ -441,6 +465,10 @@ async def async_main() -> None:
         except asyncio.CancelledError:
             pass
         await orchestrator.stop()
+        try:
+            await adapter.close()
+        except Exception as exc:
+            logger.warning("adapter_close_failed err='{}'", exc)
         await db_manager.close()
 
 
