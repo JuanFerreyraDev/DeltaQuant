@@ -466,11 +466,12 @@ class BinanceAdapter(ExchangeAdapter):
             # a fresh ccxt.pro instance instead of reusing a potentially
             # dirty connection after a server-side disconnect (code 1006).
             if self._ws_client is not None:
+                ws_to_close = self._ws_client
+                self._ws_client = None
                 try:
-                    await self._ws_client.close()
+                    await ws_to_close.close()
                 except Exception:
                     pass
-                self._ws_client = None
 
     async def get_trading_fees(self, symbol: str) -> TradingFees:
         """Fetch maker/taker fees for a symbol, with in-process caching.
