@@ -635,3 +635,22 @@ class BinanceAdapter(ExchangeAdapter):
         markets = await loop.run_in_executor(None, self._load_markets)
         _log_weight(self._client, "load_markets")
         return markets
+
+    async def close(self) -> None:
+        """Release both WebSocket and REST underlying client sessions."""
+        if self._ws_client is not None:
+            ws_to_close = self._ws_client
+            self._ws_client = None
+            try:
+                await ws_to_close.close()
+            except Exception:
+                pass
+        if hasattr(self._client, "close"):
+            try:
+                close_fn = getattr(self._client, "close")
+                if asyncio.iscoroutinefunction(close_fn):
+                    await close_fn()
+                else:
+                    close_fn()
+            except Exception:
+                pass
