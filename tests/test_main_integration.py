@@ -301,3 +301,45 @@ async def test_ws_loop_cancellation_during_tick_wait_is_clean(
     assert not start_task.cancelled()
     assert start_task.exception() is None
 
+
+@pytest.mark.asyncio
+async def test_fee_fetch_failure_excludes_symbol_and_triangles(
+    db_manager, risk_manager, executor, test_settings
+):
+    """When fee fetch fails for a symbol, fee_rates does not include it, excluding its triangles."""
+    batch = [
+        {"symbol": "BTC/USDT", "quoteVolume": "10000000", "last": "50000"},
+        {"symbol": "ETH/USDT", "quoteVolume": "5000000", "last": "3000"},
+        {"symbol": "ETH/BTC", "quoteVolume": "2000", "last": "0.06"},
+    ]
+    adapter = AsyncMock()
+    adapter.fetch_tickers_24h = AsyncMock(return_value=batch)
+
+    async def mock_get_trading_fees(symbol: str):
+        if symbol == "ETH/BTC":
+            raise Exception("Fee fetch network failure")
+        return TradingFees(symbol, Decimal("0.00075"), Decimal("0.00075"))
+
+    adapter.get_trading_fees = AsyncMock(side_effect=mock_get_trading_fees)
+
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+    )
+
+    await orchestrator.refresh_triangles()
+
+    assert "BTCUSDT" in orchestrator.fee_rates
+    assert "ETHUSDT" in orchestrator.fee_rates
+    assert "ETH/BTC" not in orchestrator.fee_rates
+
+    now_ms = int(time.time() * 1000)
+    orchestrator.evaluations_count = 0
+    tick = BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms)
+    await orchestrator._process_tick(tick)
+
+    assert orchestrator.evaluations_count == 0
+

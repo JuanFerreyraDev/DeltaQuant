@@ -110,7 +110,9 @@ class Orchestrator:
         pairs = filter_pairs_by_volume(raw_tickers, self.settings.MIN_VOLUME_USDT)
         triangles = generate_triangles(pairs)
 
-        # Pre-fetch fee rates concurrently for all new symbols present in filtered pairs
+        # Pre-fetch fee rates concurrently for all new symbols present in filtered pairs.
+        # If fee fetch fails for a symbol, log a warning and do not populate fee_rates[sym];
+        # the triangle stays excluded from evaluation until a future refresh succeeds.
         symbols_to_fetch = [p.symbol for p in pairs if p.symbol not in self.fee_rates]
         if symbols_to_fetch:
             async def _fetch_one_fee(sym: str) -> None:
@@ -118,9 +120,7 @@ class Orchestrator:
                     fees = await get_effective_fees(self.adapter, sym)
                     self.fee_rates[sym] = fees
                 except Exception as exc:
-                    logger.warning("fee_fetch_failed symbol={} err={} (using default fee fallback)", sym, exc)
-                    default_raw = TradingFees(sym, Decimal("0.001"), Decimal("0.001"))
-                    self.fee_rates[sym] = apply_bnb_discount(default_raw) if self.settings.USE_BNB_FEE_DISCOUNT else default_raw
+                    logger.warning("fee_fetch_failed symbol={} err={}", sym, exc)
 
             await asyncio.gather(*[_fetch_one_fee(sym) for sym in symbols_to_fetch])
 
