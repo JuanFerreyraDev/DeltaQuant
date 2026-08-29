@@ -362,3 +362,102 @@ class TestSubscribeBookTicker:
             "synthesized or re-yielded."
         )
 
+    @pytest.mark.asyncio
+    async def test_symbol_formats_round_trip_flat_bid_ask(self, adapter):
+        """Yielded BookTicker correctly parses FLAT bid/ask fields (ccxt >= 4.5 format)."""
+        fake_ws = MagicMock()
+        call_counter = {"n": 0}
+
+        async def fake_watch(symbols_list):
+            call_counter["n"] += 1
+            if call_counter["n"] > 1:
+                raise StopAsyncIteration
+            return {
+                "BTC/USDT": {
+                    "symbol": "BTC/USDT",
+                    "bid": Decimal("50000.0"),
+                    "ask": Decimal("50001.0"),
+                },
+                "ETH/BTC": {
+                    "symbol": "ETH/BTC",
+                    "bid": Decimal("0.05"),
+                    "ask": Decimal("0.0501"),
+                },
+            }
+
+        fake_ws.watch_bids_asks = AsyncMock(side_effect=fake_watch)
+        adapter._ws_client = fake_ws
+
+        it = adapter.subscribe_book_ticker(["BTCUSDT", "ETH/BTC"])
+        collected = [t async for t in it]
+
+        by_symbol = {t.symbol: t for t in collected}
+        assert "BTCUSDT" in by_symbol
+        assert "ETH/BTC" in by_symbol
+        assert isinstance(by_symbol["BTCUSDT"].bid, Decimal)
+        assert by_symbol["BTCUSDT"].bid == Decimal("50000.0")
+        assert by_symbol["BTCUSDT"].ask == Decimal("50001.0")
+
+    @pytest.mark.asyncio
+    async def test_ws_client_reset_to_none_after_exit_and_recreated_on_next_call(self, adapter):
+        """After WS stream exits (StopAsyncIteration or Exception), _ws_client is None, and next call recreates it."""
+        import ccxt.pro as ccxt_pro
+
+        constructed_clients = []
+
+        class FakeWsClient:
+            def __init__(self, *a, **kw):
+                self.closed = False
+                constructed_clients.append(self)
+
+            async def watch_bids_asks(self, sl):
+                if len(constructed_clients) == 1:
+                    raise StopAsyncIteration
+                else:
+                    raise RuntimeError("Simulated network exception")
+
+            async def close(self):
+                self.closed = True
+
+        orig_binance = ccxt_pro.binance
+        try:
+            ccxt_pro.binance = FakeWsClient
+
+            # Path 1: StopAsyncIteration (normal test/clean stream exit)
+            adapter._ws_client = None
+            it1 = adapter.subscribe_book_ticker(["BTCUSDT"])
+            async for _ in it1:
+                pass
+            assert adapter._ws_client is None
+            assert len(constructed_clients) == 1
+            assert constructed_clients[0].closed is True
+
+            # Path 2: Production exception path (ConnectionError)
+            it2 = adapter.subscribe_book_ticker(["BTCUSDT"])
+            with pytest.raises(ConnectionError):
+                async for _ in it2:
+                    pass
+            assert adapter._ws_client is None
+            assert len(constructed_clients) == 2
+            assert constructed_clients[1].closed is True
+        finally:
+            ccxt_pro.binance = orig_binance
+
+    @pytest.mark.asyncio
+    async def test_binance_adapter_close_safely_closes_and_is_idempotent(self, adapter):
+        """BinanceAdapter.close() safely closes _ws_client and _client, is idempotent, and works when _ws_client is None."""
+        ws_mock = AsyncMock()
+        rest_mock = AsyncMock()
+        adapter._ws_client = ws_mock
+        adapter._client = rest_mock
+
+        # First call closes both clients and resets _ws_client to None
+        await adapter.close()
+        ws_mock.close.assert_awaited_once()
+        rest_mock.close.assert_awaited_once()
+        assert adapter._ws_client is None
+
+        # Second call (idempotent when _ws_client is already None) does not crash or re-close _ws_client
+        await adapter.close()
+        assert adapter._ws_client is None
+
