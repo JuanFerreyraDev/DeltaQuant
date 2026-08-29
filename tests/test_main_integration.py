@@ -343,3 +343,36 @@ async def test_fee_fetch_failure_excludes_symbol_and_triangles(
 
     assert orchestrator.evaluations_count == 0
 
+
+@pytest.mark.asyncio
+async def test_refresh_triangles_first_call_does_not_set_resubscribe_event(
+    db_manager, risk_manager, executor, test_settings
+):
+    """First-ever call to refresh_triangles (old_subscribed is empty) does NOT set _resubscribe_event."""
+    batch = [
+        {"symbol": "BTC/USDT", "quoteVolume": "10000000", "last": "50000"},
+        {"symbol": "ETH/USDT", "quoteVolume": "5000000", "last": "3000"},
+        {"symbol": "ETH/BTC", "quoteVolume": "2000", "last": "0.06"},
+    ]
+    adapter = AsyncMock()
+    adapter.fetch_tickers_24h = AsyncMock(return_value=batch)
+    adapter.get_trading_fees = AsyncMock(
+        side_effect=lambda s: TradingFees(s, Decimal("0.00075"), Decimal("0.00075"))
+    )
+
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+    )
+
+    assert orchestrator.subscribed_symbols == set()
+    assert not orchestrator._resubscribe_event.is_set()
+
+    await orchestrator.refresh_triangles()
+
+    assert orchestrator.subscribed_symbols == {"ETH/BTC", "ETHUSDT", "BTCUSDT"}
+    assert not orchestrator._resubscribe_event.is_set()
+

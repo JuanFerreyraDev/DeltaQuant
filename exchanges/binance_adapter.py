@@ -391,7 +391,11 @@ class BinanceAdapter(ExchangeAdapter):
         unified_symbols = list(native_to_unified.values())
 
         # ── Step 2: ensure a ccxt.pro client is ready ───────────────────────
-
+        # Note: apiKey/secret are intentionally omitted here because watch_bids_asks
+        # streams public market data, which does not require authentication. Omitting
+        # credentials avoids unnecessary API auth overhead on public streams.
+        # Private channels (e.g. FOK order flow in Phase 5) use self._client (REST)
+        # or dedicated authenticated connections.
         if self._ws_client is None:
             self._ws_client = ccxt_pro.binance(
                 {
