@@ -26,18 +26,18 @@
 
 ## Test suite
 
-**181 / 181 tests passing** across 12 test modules:
+**186 / 186 tests passing** across 12 test modules:
 
 | Module | Tests |
 |---|---|
 | `test_base.py` | 18 |
 | `test_binance_adapter_create.py` | 5 |
-| `test_binance_ws_and_weight.py` | 11 |
+| `test_binance_ws_and_weight.py` | 14 |
 | `test_database.py` | 5 |
 | `test_evaluator.py` | 11 |
 | `test_fees_bnb_discount.py` | 10 |
 | `test_graph.py` | 45 |
-| `test_main_integration.py` | 5 |
+| `test_main_integration.py` | 7 |
 | `test_reconciliation.py` | 9 |
 | `test_risk.py` | 10 |
 | `test_settings.py` | 40 |
