@@ -122,19 +122,35 @@ sqlite3 deltaquant.db "SELECT metric_name, metric_value, datetime(timestamp_ms/1
 
 ---
 
-## ⚠️ DRY_RUN Validation Status
+## DRY_RUN Validation Status
 
-Phase 3 dry-run validation is a **real elapsed-time requirement** per the Technical Plan §8 and the roadmap (§5, Fase 3):
+**COMPLETE** — the final stable observation run is continuous from 2026-08-29 20:38:48 UTC through 2026-09-02 00:09:15 UTC (~75 hours, 3d 3h 30m 27s).
 
-> *"Correr en DRY_RUN varios días, revisar métricas de fill rate teórico y PnL neto de comisiones antes de avanzar."*
+| Observation result | Actual value |
+|---|---:|
+| Evaluations | 5,543,022 |
+| Profitable signals | 0 |
+| Executions | 0 |
+| `risk_is_paused = 1.0` rows | 0 / 4,133 |
+| Heartbeats in final run | 4,133 |
+| Heartbeat gaps > 180s in final run | 0 |
+| Total heartbeat-gap time in final run | 0 s |
+| Longest heartbeat gap in final run | 0 s |
+| Effective uptime (final run) | 4,133 / 4,133 (100%) |
+| Resubscription events (final run) | 62 |
+| Remote-close 1006 events (final run) | 94 |
 
-**Observation protocol (72-hour run):**
-1. Ensure the systemd service is active (`systemctl --user status deltaquant`).
-2. Run continuously for 72 hours.
-3. Periodically review evaluation progress and logs.
-4. Review collected telemetry data at hour 72 to calibrate `MAX_TICK_AGE_MS`, `SAFETY_MARGIN`, and risk limits before proceeding to Phase 4.
+**Note:** The SQLite database contains earlier test-run metrics (prior to 2026-08-29 20:38:48) accumulated during debugging phases. The validation figures above are scoped to the final stable run only.
 
-**`develop` will be tagged `v0.3.0-fase3-dryrun` upon completion of the 72h observation period.**
+The zero-profitable-signal result is a finding: with the current highest-volume USDT pair set and `SAFETY_MARGIN = 0.10%`, no triangular arbitrage opportunity clearing costs was observed in 5.5M+ evaluations over 75+ hours of continuous operation. Future options remain open and undecided: lower `SAFETY_MARGIN`, sacrificing some slippage/latency buffer; or lower `MIN_VOLUME_USDT`, admitting less efficient pairs with thinner books and more FOK failures.
+
+### Calibration limitation
+
+The Phase 3 exit requirement to recalibrate `MAX_TICK_AGE_MS` and `SAFETY_MARGIN` against empirical latency/slippage distributions could not be completed. Per-tick `max_age_ms` and near-margin `net_return` values were never persisted; the database contains aggregate counters only. This is an instrumentation gap discovered at closeout, not a conclusion about market data.
+
+There is no data supporting a change from the initial heuristic values: `MAX_TICK_AGE_MS = 200ms` and `SAFETY_MARGIN = 0.10%` remain unchanged, heuristic, and not empirically confirmed. No retrospective estimate has been made from aggregate counts. ADR-007 records the limitation and requires an empirical distribution before `MAX_TICK_AGE_MS` is tightened.
+
+**`develop` is ready to be tagged `v0.3.0-fase3-dryrun`.**
 
 ---
 
