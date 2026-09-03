@@ -598,6 +598,7 @@ async def async_main() -> None:
     # from an already-instantiated Orchestrator, then the Orchestrator receives
     # the concrete bot instance. Keep this order to avoid partial wiring.
     orchestrator.telegram_bot = telegram_bot
+    executor.incident_alert_sender = telegram_bot.send_incident_alert
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()

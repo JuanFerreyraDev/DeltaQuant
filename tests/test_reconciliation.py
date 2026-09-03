@@ -22,7 +22,7 @@ Arithmetic verification notes:
 
 from decimal import Decimal
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from sqlalchemy import text
 
 from config.settings import Settings
@@ -401,3 +401,86 @@ class TestCircuitBreakerAndRiskGate:
         assert result.status == "REJECTED_RISK"
         assert result.legs_filled == 0
         assert "exceeds cap" in result.error_message
+
+
+class TestIncidentAlerting:
+    """Tests for incident and circuit-breaker alert callback semantics."""
+
+    @pytest.mark.asyncio
+    async def test_incident_alert_fires_once_per_reconciliation(self, risk_manager, settings_dry_run, real_pipeline):
+        """A reconciliation incident sends one incident alert message."""
+        alert_sender = AsyncMock()
+        ex = Executor(
+            adapter=MagicMock(),
+            risk_manager=risk_manager,
+            db_manager=None,
+            settings=settings_dry_run,
+            incident_alert_sender=alert_sender,
+        )
+        triangle, _, _, best = real_pipeline
+
+        result = await ex.execute_triangle(
+            triangle=triangle,
+            pair_symbols=best.pair_symbols,
+            position_usdt=Decimal("100"),
+            expected_net_return=best.net_return,
+            simulated_leg_failures={1: True},
+        )
+
+        assert result.status == "FAILED_RECONCILED"
+        assert alert_sender.await_count == 1
+        sent_message = alert_sender.await_args_list[0].args[0]
+        assert "Reconciliation incident recorded" in sent_message
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_alert_fires_once_on_trip(self, risk_manager, settings_dry_run, real_pipeline):
+        """Circuit-breaker alert fires exactly once when the threshold is crossed."""
+        alert_sender = AsyncMock()
+        ex = Executor(
+            adapter=MagicMock(),
+            risk_manager=risk_manager,
+            db_manager=None,
+            settings=settings_dry_run,
+            incident_alert_sender=alert_sender,
+        )
+        triangle, _, _, best = real_pipeline
+
+        for _ in range(3):
+            await ex.execute_triangle(
+                triangle=triangle,
+                pair_symbols=best.pair_symbols,
+                position_usdt=Decimal("100"),
+                expected_net_return=best.net_return,
+                simulated_leg_failures={1: True},
+            )
+
+        # 3 incident alerts + 1 breaker alert
+        assert alert_sender.await_count == 4
+        breaker_alerts = [
+            call.args[0] for call in alert_sender.await_args_list if "Circuit breaker tripped" in call.args[0]
+        ]
+        assert len(breaker_alerts) == 1
+
+    @pytest.mark.asyncio
+    async def test_alert_send_failure_does_not_break_reconciliation(self, risk_manager, settings_dry_run, real_pipeline):
+        """Alert sender exceptions are swallowed; reconciliation still completes."""
+        alert_sender = AsyncMock(side_effect=RuntimeError("telegram send failure"))
+        ex = Executor(
+            adapter=MagicMock(),
+            risk_manager=risk_manager,
+            db_manager=None,
+            settings=settings_dry_run,
+            incident_alert_sender=alert_sender,
+        )
+        triangle, _, _, best = real_pipeline
+
+        result = await ex.execute_triangle(
+            triangle=triangle,
+            pair_symbols=best.pair_symbols,
+            position_usdt=Decimal("100"),
+            expected_net_return=best.net_return,
+            simulated_leg_failures={1: True},
+        )
+
+        assert result.status == "FAILED_RECONCILED"
+        assert result.legs_filled == 1
