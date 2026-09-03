@@ -89,14 +89,24 @@ class Settings(BaseSettings):
         description="Minimum 24h volume (USDT) for a pair to enter the graph.",
     )
     SAFETY_MARGIN: Decimal = Field(
-        default=Decimal("0.0015"),
+        default=Decimal("0.0010"),
         gt=Decimal("0"),
         description="Required net return above 1.0 to flag an opportunity.",
     )
     MAX_TICK_AGE_MS: int = Field(
-        default=300,
+        default=200,
         gt=0,
         description="Max book-ticker age in ms before the price is stale.",
+    )
+    PAIR_REFRESH_INTERVAL_SECONDS: int = Field(
+        default=3600,
+        gt=0,
+        description="Interval in seconds for periodic 24h pair/volume graph refresh.",
+    )
+    METRICS_PERSIST_INTERVAL_SECONDS: int = Field(
+        default=60,
+        gt=0,
+        description="Interval in seconds for persisting system and evaluation metrics.",
     )
 
     # ── Risk limits ───────────────────────────────────────────────────────────
@@ -114,6 +124,16 @@ class Settings(BaseSettings):
         default=2,
         ge=1,
         description="Maximum number of in-flight triangle executions.",
+    )
+    CIRCUIT_BREAKER_INCIDENT_COUNT: int = Field(
+        default=3,
+        ge=1,
+        description="Number of emergency liquidation incidents before auto-pausing.",
+    )
+    CIRCUIT_BREAKER_WINDOW_MINUTES: int = Field(
+        default=60,
+        ge=1,
+        description="Time window in minutes for circuit breaker incident counting.",
     )
 
     # ── Redis (control-plane only) ────────────────────────────────────────────

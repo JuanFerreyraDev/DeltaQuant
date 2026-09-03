@@ -1,25 +1,18 @@
-"""Binance exchange adapter — Phase 1 read-only implementation.
+"""Binance exchange adapter — REST + WebSocket bookTicker (Phase 2).
 
-Implements ``ExchangeAdapter`` for Binance using the ``ccxt`` REST client.
-Only market-data and account-read methods are implemented in this phase;
-WebSocket subscription (``subscribe_book_ticker``) and order placement
-(``place_fok_order``) are stubbed with ``NotImplementedError`` and will be
-completed in Phase 2 and Phase 3 respectively.
+Implements ``ExchangeAdapter`` for Binance using ``ccxt`` (REST) and
+``ccxt.pro`` (WebSocket).  WebSocket bookTicker subscription is implemented
+in this phase; FOK order placement is deferred to Phase 3.
 
-Phase scope (per the technical plan, §8 Fase 1):
-    - Fetch all trading pairs and their 24-hour volume via REST.
-    - Fetch trading fees for a symbol.
-    - Fetch account balance for an asset.
+Phase scope (per the technical plan, §8 Fase 2):
+    - ``subscribe_book_ticker``: top-of-book (best bid/ask) push updates via
+      ``ccxt.pro``'s ``watch_bids_asks`` stream.
+    - Rate-limit weight tracking: log weight consumed per request from the
+      first WS session onward (technical plan §9.3).
+    - Volume, fees, and balance methods from Phase 1 are unchanged.
 
-Out of scope for Phase 1 (explicitly deferred):
-    - ``subscribe_book_ticker``: requires ccxt.pro WebSocket (Phase 2).
+Out of scope (explicitly deferred):
     - ``place_fok_order``: order execution (Phase 3).
-
-Notes on ccxt usage:
-    ``ccxt`` (synchronous REST) is used here; ``ccxt.pro`` (WebSocket) is
-    introduced in Phase 2.  The adapter wraps the blocking ccxt calls in
-    ``asyncio.get_event_loop().run_in_executor`` so they don't block the
-    event loop, even though the full async pipeline is not wired until Phase 2.
 
 Symbol format contract (ADR-002):
     The engine layer (``core/graph.py``) produces symbols in a mixed native
@@ -38,6 +31,12 @@ Symbol format contract (ADR-002):
     USDT-quoted symbols (``"BTC/USDT"`` → ``"BTCUSDT"``); do not call it on
     cross-pair unified symbols.
 
+Rate-limit weight tracking (§9.3):
+    After every REST call, the consumed 1-minute weight is extracted from
+    response headers (``X-MBX-USED-WEIGHT-1M``) and emitted via the same
+    logging path as WS connection events.  Weight is logged proactively, not
+    reactively after a ban.
+
 Security:
     API keys are read from ``Settings`` at construction time.  No key or
     secret is ever stored as a plain module-level variable or logged.
@@ -46,10 +45,13 @@ Security:
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from decimal import Decimal
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 import ccxt
+import ccxt.pro as ccxt_pro
 
 from config.settings import Settings
 from exchanges.base import (
@@ -59,6 +61,8 @@ from exchanges.base import (
     OrderResult,
     TradingFees,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ── Symbol format conversion ──────────────────────────────────────────────────
@@ -127,15 +131,68 @@ def _unified_to_native(unified_symbol: str) -> str:
     return unified_symbol.replace("/", "")
 
 
+# ── Rate-limit weight tracking (technical plan §9.3) ────────────────────────
+
+
+def _extract_weight_from_last_response(client: ccxt.binance) -> Optional[int]:
+    """Extract the consumed 1-minute weight from a ccxt client's last HTTP response.
+
+    Binance returns cumulative weight consumed in the current 1-minute window via
+    the ``X-MBX-USED-WEIGHT-1M`` response header.  This helper grabs it from
+    ``client.last_http_response.headers`` when available, returning ``None`` if
+    the header is absent (e.g. first call, or no HTTP round-trip happened yet).
+
+    Args:
+        client: A ccxt REST client whose ``last_http_response`` attribute may
+            contain the most recent response headers.
+
+    Returns:
+        Integer weight value if the header exists, otherwise ``None``.
+    """
+    try:
+        resp = getattr(client, "last_http_response", None)
+        if resp is None:
+            return None
+        headers = getattr(resp, "headers", None)
+        if headers is None:
+            return None
+        raw = headers.get("X-MBX-USED-WEIGHT-1M")
+        if raw is None:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _log_weight(client: ccxt.binance, operation: str) -> None:
+    """Log the current rate-limit weight after a REST operation.
+
+    Silently no-ops if the weight header cannot be extracted; never raises.
+
+    Args:
+        client: ccxt REST client (source of ``last_http_response``).
+        operation: Human-readable operation name for the log message, e.g.
+            ``"fetch_tickers_24h"``.
+    """
+    weight = _extract_weight_from_last_response(client)
+    if weight is not None:
+        logger.info(
+            "binance_weight op=%s weight_1m=%s", operation, weight
+        )
+
+
 class BinanceAdapter(ExchangeAdapter):
     """Binance implementation of ``ExchangeAdapter``.
 
-    Wraps ``ccxt.binance`` for REST access.  Instantiate via the async
-    factory ``BinanceAdapter.create(settings)`` rather than the constructor
-    directly, to allow for any async initialisation steps added in later phases.
+    Wraps ``ccxt.binance`` for REST access and ``ccxt.pro.binance`` for
+    WebSocket bookTicker pushes.  Instantiate via the async factory
+    ``BinanceAdapter.create(settings)`` rather than the constructor directly.
 
     Attributes:
         _client: Underlying ``ccxt.binance`` REST client instance.
+        _ws_client: Underlying ``ccxt.pro.binance`` async WebSocket client,
+            constructed lazily on the first call to ``subscribe_book_ticker`` so
+            that tests that don't exercise WS don't need a live connection.
         _settings: Validated application settings.
         _fee_cache: In-process cache of ``TradingFees`` objects keyed by
             symbol, populated lazily on first request.  Fee tiers change
@@ -149,16 +206,24 @@ class BinanceAdapter(ExchangeAdapter):
             evict each other's entries.
     """
 
-    def __init__(self, client: ccxt.binance, settings: Settings) -> None:
-        """Initialise the adapter with an already-constructed ccxt client.
+    def __init__(
+        self,
+        client: ccxt.binance,
+        settings: Settings,
+        ws_client: Optional[ccxt_pro.binance] = None,
+    ) -> None:
+        """Initialise the adapter with already-constructed ccxt clients.
 
         Prefer ``BinanceAdapter.create(settings)`` over calling this directly.
 
         Args:
-            client: A configured ``ccxt.binance`` instance.
+            client: A configured ``ccxt.binance`` REST instance.
             settings: Validated ``Settings`` object from ``config.settings``.
+            ws_client: Optional pre-built ``ccxt.pro.binance`` instance.  If
+                ``None``, one is constructed lazily on the first WS call.
         """
         self._client: ccxt.binance = client
+        self._ws_client: Optional[ccxt_pro.binance] = ws_client
         self._settings: Settings = settings
         self._fee_cache: dict[str, TradingFees] = {}
         self._markets_cache: dict | None = None
@@ -169,14 +234,17 @@ class BinanceAdapter(ExchangeAdapter):
     async def create(cls, settings: Settings) -> "BinanceAdapter":
         """Async factory: construct and return a ready ``BinanceAdapter``.
 
-        Builds the ``ccxt.binance`` client with the credentials from
+        Builds the ``ccxt.binance`` REST client with the credentials from
         ``settings``, then runs a real connectivity and authentication check
         by calling ``load_markets()`` off the event loop.  This surfaces
         invalid credentials (``ccxt.AuthenticationError``) and network
         failures (``ccxt.NetworkError``) at startup rather than on the first
         operational request.
 
-        In Phase 2 this factory will also open the WebSocket connection.
+        The ``ccxt.pro`` WebSocket client is NOT opened here.  It is
+        constructed lazily on the first call to ``subscribe_book_ticker`` so
+        that non-WS callers (e.g. tests, the volume-filter REST-only phase) pay no
+        WS connection overhead.
 
         Args:
             settings: Validated ``Settings`` loaded from the environment.
@@ -215,7 +283,8 @@ class BinanceAdapter(ExchangeAdapter):
             return client
 
         client = await loop.run_in_executor(None, _build_and_load)
-        adapter = cls(client, settings)
+        _log_weight(client, "create/load_markets")
+        adapter = cls(client, settings, ws_client=None)
         # Pre-populate the instance cache from the already-loaded markets so
         # the first get_markets() call is free.
         adapter._markets_cache = client.markets
@@ -246,41 +315,167 @@ class BinanceAdapter(ExchangeAdapter):
             ccxt.NetworkError: On connectivity failure.
             ccxt.ExchangeError: If the exchange returns an error response.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         raw: dict[str, dict] = await loop.run_in_executor(
             None, self._client.fetch_tickers
         )
-        # ccxt.fetch_tickers returns a dict keyed by symbol; return as a list
-        # so the caller doesn't need to know the internal ccxt structure.
+        _log_weight(self._client, "fetch_tickers_24h")
         return list(raw.values())
 
     async def subscribe_book_ticker(
         self, symbols: list[str]
     ) -> AsyncIterator[BookTicker]:
-        """Subscribe to best-bid/ask WebSocket stream (Phase 2).
+        """Subscribe to best-bid/ask (top-of-book) WebSocket updates.
 
-        Not implemented in Phase 1.  WebSocket connectivity via ccxt.pro is
-        introduced in Phase 2 (``feature/f2-binance-ws-bookticker``).
+        Uses ``ccxt.pro``'s ``watch_bids_asks`` stream, which maps 1-to-1 to
+        Binance's ``bookTicker`` WebSocket endpoint — the cheapest and most
+        efficient way to receive push updates of the best bid/ask price every
+        time either changes.
 
-        **Symbol format**: will accept native format symbols (e.g. ``"BTCUSDT"``)
-        and convert to unified format internally for ccxt.pro calls. See ADR-002
-        for the symbol format contract.
+        **Symbol format**: accepts the mixed native format defined by ADR-002:
+        USDT-quoted pairs arrive concatenated (e.g. ``"BTCUSDT"``) and cross
+        pairs arrive slash-delimited (e.g. ``"ETH/BTC"``).  Both sub-formats
+        are translated through ``_native_to_unified`` before being handed to
+        ccxt.pro, which expects unified ``"BASE/QUOTE"`` strings.
+
+        **Payload semantics & Staleness correctness**: On each WebSocket push,
+        ``ccxt.pro.binance.watch_bids_asks(symbols)`` returns **only** the symbol(s)
+        whose price actually changed in that push message (verified directly in
+        ``ccxt.pro.binance`` source: ``watch_bids_asks`` -> ``watch_multi_ticker_helper``
+        -> ``handle_tickers_and_bids_asks``).  Symbols whose prices did not change
+        are omitted from the returned payload, so their cached ``BookTicker.timestamp_ms``
+        in the evaluator correctly stops advancing, allowing the staleness check
+        to accurately flag un-updated market legs.
+
+        **Staleness semantics**: the yielded ``BookTicker.timestamp_ms`` is
+        populated locally with ``time.time_ns() // 1_000_000`` at the moment
+        the message is received from the WebSocket.  This is intentionally a
+        *local-receive* timestamp, not the exchange-emitted timestamp, because
+        the staleness check in the evaluator is a defence against *local*
+        data-freshness loss (disconnected socket, ccxt.pro queue backup, etc.)
+        — exchange-side clock skew is irrelevant to that goal.
+
+        **Testability & Error handling semantics**: The ``except StopAsyncIteration``
+        branch exists solely to make this generator deterministically testable in
+        the test suite (allowing mocks to signal end of stream).  It does NOT
+        correspond to any exchange or ccxt.pro disconnection event.  Real network
+        disconnections or WebSocket crashes in production trigger ``except Exception``,
+        which logs an ``ERROR`` message and raises ``ConnectionError``.
 
         Args:
-            symbols: List of native format symbols to subscribe to (e.g.
-                ``["BTCUSDT", "ETHUSDT"]``).
-
-        Raises:
-            NotImplementedError: Always, in Phase 1.
+            symbols: List of native-format symbol strings to subscribe to,
+                e.g. ``["BTCUSDT", "ETH/BTC", "ETHUSDT"]``.  Empty list is
+                accepted but yields nothing.
 
         Yields:
-            Nothing — this method is not yet implemented.
+            ``BookTicker`` snapshot each time the exchange pushes an update
+            for any of the subscribed symbols.  The ``symbol`` field on the
+            yielded dataclass is in *engine-native* format (the same shape
+            that was passed in) so downstream consumers never need to know
+            about ccxt unified notation.
+
+        Raises:
+            ConnectionError: If the underlying ccxt.pro WebSocket cannot be
+                established or is terminated fatally after retries exhaust.
         """
-        raise NotImplementedError(
-            "subscribe_book_ticker is implemented in Phase 2 "
-            "(feature/f2-binance-ws-bookticker)."
-        )
-        yield  # pragma: no cover — keeps the abstract generator signature
+        if not symbols:
+            return
+
+        # ── Step 1: build a bidirectional symbol mapping ────────────────────
+        native_to_unified: dict[str, str] = {}
+        unified_to_native: dict[str, str] = {}
+        for native in symbols:
+            unified = _native_to_unified(native)
+            native_to_unified[native] = unified
+            unified_to_native[unified] = native
+        unified_symbols = list(native_to_unified.values())
+
+        # ── Step 2: ensure a ccxt.pro client is ready ───────────────────────
+        # Note: apiKey/secret are intentionally omitted here because watch_bids_asks
+        # streams public market data, which does not require authentication. Omitting
+        # credentials avoids unnecessary API auth overhead on public streams.
+        # Private channels (e.g. FOK order flow in Phase 5) use self._client (REST)
+        # or dedicated authenticated connections.
+        if self._ws_client is None:
+            self._ws_client = ccxt_pro.binance(
+                {
+                    "enableRateLimit": True,
+                    "options": {
+                        "defaultType": "spot",
+                        "adjustForTimeDifference": True,
+                    },
+                }
+            )
+            logger.info(
+                "binance_ws connect symbols=%s",
+                len(unified_symbols),
+            )
+
+        ws = self._ws_client
+
+        # ── Step 3: stream updates forever (until caller breaks or stream closes) ─
+
+        try:
+            while True:
+                try:
+                    payload: dict = await ws.watch_bids_asks(unified_symbols)
+                except StopAsyncIteration:
+                    # Test harness loop termination signal.  Not a real exchange disconnection.
+                    logger.warning(
+                        "binance_ws stream closed by test harness / iterator for symbols=%s",
+                        len(unified_symbols),
+                    )
+                    return
+                except Exception as exc:  # pragma: no cover — network path
+                    # Real exchange connection failure path in production.
+                    logger.error("binance_ws connection error: %s", exc)
+                    raise ConnectionError(
+                        f"Binance bookTicker WS failed: {exc}"
+                    ) from exc
+
+                recv_ts_ms = time.time_ns() // 1_000_000
+
+                for unified, tick in payload.items():
+                    native = unified_to_native.get(unified)
+                    if native is None:
+                        continue
+
+                    # ccxt >=4.5 returns flat 'bid'/'ask' floats from
+                    # watch_bids_asks; earlier versions used nested
+                    # 'bids'/'asks' arrays.  Read flat fields first,
+                    # fall back to nested arrays for test compatibility.
+                    best_bid_price = tick.get("bid")
+                    best_ask_price = tick.get("ask")
+
+                    if best_bid_price is None or best_ask_price is None:
+                        bids = tick.get("bids") or []
+                        asks = tick.get("asks") or []
+                        if not bids or not asks:
+                            continue
+                        best_bid_price = bids[0][0]
+                        best_ask_price = asks[0][0]
+
+                    yield BookTicker(
+                        symbol=native,
+                        bid=Decimal(str(best_bid_price)),
+                        ask=Decimal(str(best_ask_price)),
+                        timestamp_ms=recv_ts_ms,
+                    )
+        finally:
+            logger.warning(
+                "binance_ws stream exited/terminated for symbols=%s",
+                len(unified_symbols),
+            )
+            # Reset ws client so next subscribe_book_ticker call creates
+            # a fresh ccxt.pro instance instead of reusing a potentially
+            # dirty connection after a server-side disconnect (code 1006).
+            if self._ws_client is not None:
+                ws_to_close = self._ws_client
+                self._ws_client = None
+                try:
+                    await ws_to_close.close()
+                except Exception:
+                    pass
 
     async def get_trading_fees(self, symbol: str) -> TradingFees:
         """Fetch maker/taker fees for a symbol, with in-process caching.
@@ -320,10 +515,11 @@ class BinanceAdapter(ExchangeAdapter):
         # Convert from native (engine format) to unified (ccxt format)
         unified_symbol = _native_to_unified(symbol)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         raw: dict = await loop.run_in_executor(
             None, self._client.fetch_trading_fee, unified_symbol
         )
+        _log_weight(self._client, f"fetch_trading_fee:{symbol}")
 
         fees = TradingFees(
             symbol=symbol,
@@ -355,8 +551,9 @@ class BinanceAdapter(ExchangeAdapter):
             ccxt.PermissionDenied: If the key lacks read-account permission.
             ccxt.NetworkError: On connectivity failure.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         raw: dict = await loop.run_in_executor(None, self._client.fetch_balance)
+        _log_weight(self._client, "fetch_balance")
 
         asset_upper = asset.upper()
         free = Decimal(str(raw.get("free", {}).get(asset_upper, "0")))
@@ -438,5 +635,26 @@ class BinanceAdapter(ExchangeAdapter):
         Raises:
             ccxt.NetworkError: On the first call if Binance is unreachable.
         """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._load_markets)
+        loop = asyncio.get_running_loop()
+        markets = await loop.run_in_executor(None, self._load_markets)
+        _log_weight(self._client, "load_markets")
+        return markets
+
+    async def close(self) -> None:
+        """Release both WebSocket and REST underlying client sessions."""
+        if self._ws_client is not None:
+            ws_to_close = self._ws_client
+            self._ws_client = None
+            try:
+                await ws_to_close.close()
+            except Exception:
+                pass
+        if hasattr(self._client, "close"):
+            try:
+                close_fn = getattr(self._client, "close")
+                if asyncio.iscoroutinefunction(close_fn):
+                    await close_fn()
+                else:
+                    close_fn()
+            except Exception:
+                pass
