@@ -20,7 +20,8 @@ Use Redis `TRADING_ENABLED` as the **durable source of truth** for desired tradi
 Synchronization rules:
 - `TRADING_ENABLED=False`: orchestrator pauses `RiskManager` with a control-plane pause reason.
 - `TRADING_ENABLED=True`: orchestrator resumes only if pause was control-plane-originated, or if an explicit operator `/resume` force-resume command is issued.
-- If `RiskManager` is paused by internal risk logic (daily-loss or circuit-breaker) while Redis still says enabled, orchestrator writes `TRADING_ENABLED=False` back to Redis with the risk pause reason.
+- If `RiskManager` transitions from not-paused to paused by internal risk logic (daily-loss or circuit-breaker), orchestrator writes `TRADING_ENABLED=False` to Redis immediately after execution returns, without waiting for the next poll cycle.
+- Poll-loop reconciliation remains as a safety net for external writes and drift detection, not the primary persistence path for internal pauses.
 
 Operator command flow:
 - `/kill`: write Redis disabled state first, then apply immediate in-process pause.
@@ -45,6 +46,7 @@ Negative / Trade-offs:
 - Integration test proving kill changes execution behavior, not only flags.
 - Integration test ensuring `/resume` clears both `is_paused` and `pause_reason`.
 - Integration test confirming Redis is not queried in `_process_tick`.
+- Integration test simulating circuit-breaker trip from reconciliation incidents, asserting immediate `TRADING_ENABLED=False` durability (no poll wait), then restart-time pause restoration.
 
 ## References
 

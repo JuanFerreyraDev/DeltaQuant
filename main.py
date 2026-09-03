@@ -27,6 +27,8 @@ from exchanges.binance_adapter import BinanceAdapter
 from exchanges.fees import apply_bnb_discount, get_effective_fees
 from storage.database import DatabaseManager
 from storage.models import Metric
+from storage.redis_client import RedisControlPlaneClient
+from interfaces.telegram_bot import TelegramControlPlane
 
 
 class InterceptHandler(logging.Handler):
@@ -71,6 +73,8 @@ class Orchestrator:
         risk_manager: RiskManager,
         executor: Executor,
         settings: Settings,
+        redis_client: Optional[RedisControlPlaneClient] = None,
+        telegram_bot: Optional[TelegramControlPlane] = None,
     ) -> None:
         """Initialize the Orchestrator.
 
@@ -80,12 +84,16 @@ class Orchestrator:
             risk_manager: Risk control manager.
             executor: Triangular execution manager.
             settings: Loaded configuration parameters.
+            redis_client: Optional Redis control-plane client.
+            telegram_bot: Optional Telegram control-plane bot.
         """
         self.adapter = adapter
         self.db_manager = db_manager
         self.risk_manager = risk_manager
         self.executor = executor
         self.settings = settings
+        self.redis_client = redis_client
+        self.telegram_bot = telegram_bot
 
         self.cached_tickers: Dict[str, BookTicker] = {}
         self.fee_rates: Dict[str, TradingFees] = {}
@@ -96,12 +104,142 @@ class Orchestrator:
         self.evaluations_count: int = 0
         self.profitable_signals_count: int = 0
         self.executions_count: int = 0
+        self.control_plane_trading_enabled: Optional[bool] = None
 
         self._running: bool = False
         self._resubscribe_event: asyncio.Event = asyncio.Event()
         self._ws_task: Optional[asyncio.Task] = None
         self._refresh_task: Optional[asyncio.Task] = None
         self._metrics_task: Optional[asyncio.Task] = None
+        self._control_plane_task: Optional[asyncio.Task] = None
+        self._telegram_task: Optional[asyncio.Task] = None
+
+    def get_runtime_status(self) -> dict:
+        """Return current runtime status for control-plane interfaces."""
+        return {
+            "trading_enabled": self.control_plane_trading_enabled,
+            "evaluations_count": self.evaluations_count,
+            "profitable_signals_count": self.profitable_signals_count,
+            "executions_count": self.executions_count,
+            "risk": self.risk_manager.get_status(),
+        }
+
+    async def handle_control_action(
+        self, enabled: bool, reason: str, force_resume: bool = False
+    ) -> None:
+        """Apply operator control command and persist it in Redis.
+
+        Args:
+            enabled: Desired trading state.
+            reason: Human-readable cause for auditing.
+            force_resume: If True, resume even when pause reason is non-control-plane.
+        """
+        if self.redis_client is not None:
+            await self.redis_client.set_trading_enabled(enabled, pause_reason=reason)
+        await self._apply_trading_enabled_state(
+            enabled=enabled,
+            pause_reason=reason,
+            force_resume=force_resume,
+            source="telegram_command",
+        )
+
+    async def _sync_control_plane_once(self) -> None:
+        """Poll Redis desired state once and synchronize RiskManager state."""
+        if self.redis_client is None:
+            return
+        desired_enabled = await self.redis_client.get_trading_enabled()
+        pause_reason = await self.redis_client.get_pause_reason()
+        await self._apply_trading_enabled_state(
+            enabled=desired_enabled,
+            pause_reason=pause_reason,
+            force_resume=False,
+            source="redis_poll",
+        )
+
+    async def _apply_trading_enabled_state(
+        self,
+        enabled: bool,
+        pause_reason: str,
+        force_resume: bool,
+        source: str,
+    ) -> None:
+        """Apply desired trading state to in-process RiskManager mirror.
+
+        This keeps Redis as durable control-plane source-of-truth while still
+        enforcing immediate in-process behavior changes after operator commands.
+        """
+        if not enabled:
+            self.control_plane_trading_enabled = False
+            reason = pause_reason or "[control-plane] TRADING_ENABLED=False"
+            if (not self.risk_manager.is_paused) or (self.risk_manager.pause_reason != reason):
+                self.risk_manager.pause(reason)
+            return
+
+        self.control_plane_trading_enabled = True
+        if not self.risk_manager.is_paused:
+            return
+
+        if force_resume or self._is_control_plane_reason(self.risk_manager.pause_reason):
+            self.risk_manager.resume()
+            return
+
+        # If risk paused itself (daily-loss/circuit-breaker), reflect that pause
+        # back into Redis so restart cannot silently resume execution.
+        await self._persist_internal_pause_state(source)
+
+    async def _persist_internal_pause_state(self, source: str) -> None:
+        """Persist internal RiskManager pause state to Redis immediately.
+
+        Args:
+            source: Human-readable caller tag for structured logging.
+        """
+        if self.redis_client is None or not self.risk_manager.is_paused:
+            return
+
+        reason = self.risk_manager.pause_reason or "RiskManager paused"
+        await self.redis_client.set_trading_enabled(False, pause_reason=reason)
+        self.control_plane_trading_enabled = False
+        logger.warning(
+            "control_plane_state_reconciled source={} reason='{}'",
+            source,
+            reason,
+        )
+
+    def _is_control_plane_reason(self, reason: Optional[str]) -> bool:
+        """Return True when pause reason originated from control-plane commands."""
+        if reason is None:
+            return False
+        return reason.startswith("[control-plane]") or "TRADING_ENABLED=False" in reason
+
+    async def _periodic_control_plane_loop(self) -> None:
+        """Poll Redis control-plane state on a fixed cadence."""
+        while self._running and self.redis_client is not None:
+            try:
+                await self._sync_control_plane_once()
+                await asyncio.sleep(self.settings.CONTROL_PLANE_POLL_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("control_plane_poll_error err={}", exc)
+
+    async def _telegram_loop(self) -> None:
+        """Keep Telegram command polling alive while orchestrator runs."""
+        if self.telegram_bot is None:
+            return
+        started = False
+        try:
+            await self.telegram_bot.start()
+            started = True
+            while self._running:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("telegram_loop_fatal_error err={}", exc)
+            raise
+        finally:
+            if started:
+                await self.telegram_bot.stop()
 
     async def refresh_triangles(self) -> None:
         """Fetch 24h tickers, filter by volume, generate triangles, and update fee cache."""
@@ -204,6 +342,18 @@ class Orchestrator:
                     self.executions_count,
                     risk_status["is_paused"],
                 )
+
+                if self.redis_client is not None:
+                    await self.redis_client.set_checkpoint(
+                        "runtime_counters",
+                        {
+                            "evaluations_count": self.evaluations_count,
+                            "profitable_signals_count": self.profitable_signals_count,
+                            "executions_count": self.executions_count,
+                            "risk_is_paused": risk_status["is_paused"],
+                            "updated_at_ms": now_ms,
+                        },
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -263,12 +413,19 @@ class Orchestrator:
                         # is instantaneous. In Phase 5 live trading, order dispatch will be
                         # handled asynchronously via asyncio.create_task to avoid blocking
                         # top-of-book ticker ingestion.
+                        was_paused_before_exec = self.risk_manager.is_paused
                         await self.executor.execute_triangle(
                             triangle=triangle,
                             pair_symbols=res.pair_symbols,
                             position_usdt=self.settings.MAX_POSITION_USDT,
                             expected_net_return=res.net_return,
                         )
+                        if (not was_paused_before_exec) and self.risk_manager.is_paused:
+                            # Internal pauses (daily-loss/circuit-breaker) must be durable
+                            # immediately to survive crash/restart boundaries.
+                            await self._persist_internal_pause_state(
+                                source="post_execute_internal_pause"
+                            )
                     else:
                         logger.info(
                             "execution_blocked_by_risk reason='{}'", reason
@@ -344,6 +501,7 @@ class Orchestrator:
     async def start(self) -> None:
         """Start orchestrator tasks and monitor for completion / failures."""
         self._running = True
+        await self._sync_control_plane_once()
         await self.refresh_triangles()
 
         self._refresh_task = asyncio.create_task(
@@ -355,13 +513,23 @@ class Orchestrator:
         self._ws_task = asyncio.create_task(
             self._ws_ticker_loop(), name="ws_ticker_loop"
         )
+        if self.redis_client is not None:
+            self._control_plane_task = asyncio.create_task(
+                self._periodic_control_plane_loop(), name="control_plane_loop"
+            )
+        if self.telegram_bot is not None:
+            self._telegram_task = asyncio.create_task(
+                self._telegram_loop(), name="telegram_loop"
+            )
+
+        tasks = [self._refresh_task, self._metrics_task, self._ws_task]
+        if self._control_plane_task is not None:
+            tasks.append(self._control_plane_task)
+        if self._telegram_task is not None:
+            tasks.append(self._telegram_task)
 
         try:
-            await asyncio.gather(
-                self._refresh_task,
-                self._metrics_task,
-                self._ws_task,
-            )
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             logger.info("orchestrator_gather_cancelled")
             raise
@@ -375,7 +543,13 @@ class Orchestrator:
         """Stop all background tasks cleanly."""
         self._running = False
         self._resubscribe_event.set()
-        for task in (self._refresh_task, self._metrics_task, self._ws_task):
+        for task in (
+            self._refresh_task,
+            self._metrics_task,
+            self._ws_task,
+            self._control_plane_task,
+            self._telegram_task,
+        ):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -392,6 +566,8 @@ async def async_main() -> None:
 
     db_manager = DatabaseManager()
     await db_manager.init_db()
+    redis_client = RedisControlPlaneClient.from_settings(settings)
+    await redis_client.connect()
 
     adapter = await BinanceAdapter.create(settings)
     risk_manager = RiskManager(settings=settings)
@@ -408,7 +584,20 @@ async def async_main() -> None:
         risk_manager=risk_manager,
         executor=executor,
         settings=settings,
+        redis_client=redis_client,
+        telegram_bot=None,
     )
+    telegram_bot = TelegramControlPlane(
+        token=settings.TELEGRAM_BOT_TOKEN,
+        authorized_chat_id=settings.TELEGRAM_CHAT_ID,
+        status_provider=orchestrator.get_runtime_status,
+        control_action=orchestrator.handle_control_action,
+        pnl_provider=lambda: risk_manager.daily_pnl_usdt,
+    )
+    # Two-step wiring is intentional: TelegramControlPlane needs bound methods
+    # from an already-instantiated Orchestrator, then the Orchestrator receives
+    # the concrete bot instance. Keep this order to avoid partial wiring.
+    orchestrator.telegram_bot = telegram_bot
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -469,6 +658,7 @@ async def async_main() -> None:
             await adapter.close()
         except Exception as exc:
             logger.warning("adapter_close_failed err='{}'", exc)
+        await redis_client.close()
         await db_manager.close()
 
 
