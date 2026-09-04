@@ -22,15 +22,16 @@ Design contract — pair_symbols ordering:
 
 from dataclasses import dataclass
 from decimal import Decimal
+import asyncio
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Mapping, Optional
 
 from loguru import logger
 
 from config.settings import Settings, get_settings
-from core.graph import Triangle
+from core.graph import Triangle, parse_symbol
 from core.risk import RiskManager
-from exchanges.base import ExchangeAdapter
+from exchanges.base import BookTicker, ExchangeAdapter, OrderResult
 from storage.database import DatabaseManager
 from storage.models import Incident, Trade
 
@@ -100,6 +101,8 @@ class Executor:
         pair_symbols: tuple[str, str, str],
         position_usdt: Decimal,
         expected_net_return: Decimal,
+        path: Optional[tuple[str, str, str, str]] = None,
+        tickers: Optional[Mapping[str, BookTicker]] = None,
         simulated_leg_failures: Optional[dict[int, bool]] = None,
     ) -> ExecutionResult:
         """Execute a 3-leg triangular arbitrage cycle.
@@ -168,6 +171,8 @@ class Executor:
                     expected_net_return=expected_net_return,
                     triangle_id=triangle_id,
                     start_ns=start_ns,
+                    path=path,
+                    tickers=tickers,
                 )
 
             # ── Step 3: Register PnL and persist Trade ─────────────────────────
@@ -284,17 +289,246 @@ class Executor:
         expected_net_return: Decimal,
         triangle_id: str,
         start_ns: int,
+        path: Optional[tuple[str, str, str, str]] = None,
+        tickers: Optional[Mapping[str, BookTicker]] = None,
     ) -> ExecutionResult:  # pragma: no cover — rehearsed in Phase 5
-        """Execute parallel REST FOK orders in live mode (stub for Phase 5)."""
+        """Execute the 3 live legs in parallel and reconcile on failure."""
+        if path is None or tickers is None:
+            raise ValueError("Live execution requires both the chosen path and the current ticker snapshot")
+
+        order_plan = self._build_live_order_plan(
+            path=path,
+            pair_symbols=pair_symbols,
+            tickers=tickers,
+            position_usdt=position_usdt,
+        )
+
+        order_results_raw = await asyncio.gather(
+            *[
+                self.adapter.place_fok_order(
+                    symbol=plan["symbol"],
+                    side=plan["side"],
+                    quantity=plan["quantity"],
+                    price=plan["price"],
+                )
+                for plan in order_plan
+            ],
+            return_exceptions=True,
+        )
+
+        order_results: list[OrderResult] = []
+        for idx, result in enumerate(order_results_raw):
+            if isinstance(result, Exception):
+                logger.error(
+                    "live_order_failed triangle_id='{}' leg={} err='{}'",
+                    triangle_id,
+                    idx,
+                    result,
+                )
+                order_results.append(
+                    OrderResult(
+                        symbol=str(order_plan[idx]["symbol"]),
+                        order_id="",
+                        status="ERROR",
+                        filled_qty=Decimal("0"),
+                        avg_price=Decimal("0"),
+                        fee=Decimal("0"),
+                        fee_asset="",
+                        raw={"exception": str(result)},
+                    )
+                )
+            else:
+                order_results.append(result)
+
+        if all(result.is_filled for result in order_results):
+            duration_ms = (time.time_ns() - start_ns) // 1_000_000
+            logger.info(
+                "executor_live_success triangle_id='{}' net_return={} duration_ms={}",
+                triangle_id,
+                expected_net_return,
+                duration_ms,
+            )
+            return ExecutionResult(
+                triangle_id=triangle_id,
+                status="COMPLETED",
+                expected_net_return=expected_net_return,
+                actual_net_return=expected_net_return,
+                execution_duration_ms=duration_ms,
+                legs_filled=3,
+            )
+
+        if not order_results[0].is_filled:
+            if any(result.is_filled for result in order_results[1:]):
+                logger.error(
+                    "executor_live_unexpected_fill_without_leg0 triangle_id='{}'",
+                    triangle_id,
+                )
+                duration_ms = (time.time_ns() - start_ns) // 1_000_000
+                return ExecutionResult(
+                    triangle_id=triangle_id,
+                    status="FAILED_UNHANDLED",
+                    expected_net_return=expected_net_return,
+                    actual_net_return=Decimal("0"),
+                    execution_duration_ms=duration_ms,
+                    legs_filled=sum(1 for result in order_results if result.is_filled),
+                    error_message="Unexpected fill combination after Leg 0 failure",
+                )
+
+            duration_ms = (time.time_ns() - start_ns) // 1_000_000
+            return ExecutionResult(
+                triangle_id=triangle_id,
+                status="FAILED_LEG_0",
+                expected_net_return=expected_net_return,
+                actual_net_return=Decimal("1.0"),
+                execution_duration_ms=duration_ms,
+                legs_filled=0,
+                error_message=f"Live Leg 0 ({pair_symbols[0]}) FOK expiration",
+            )
+
+        if not order_results[1].is_filled:
+            return await self._reconcile_inventory(
+                pair_symbols=pair_symbols,
+                failed_leg_index=1,
+                position_usdt=position_usdt,
+                expected_net_return=expected_net_return,
+                triangle_id=triangle_id,
+                start_ns=start_ns,
+                error_msg=(
+                    f"Live Leg 1 ({pair_symbols[1]}) FOK expiration "
+                    f"(Leg 0 filled, Leg 1 failed)"
+                ),
+                order_plan=order_plan,
+                order_results=order_results,
+                path=path,
+                tickers=tickers,
+            )
+
+        if not order_results[2].is_filled:
+            return await self._reconcile_inventory(
+                pair_symbols=pair_symbols,
+                failed_leg_index=2,
+                position_usdt=position_usdt,
+                expected_net_return=expected_net_return,
+                triangle_id=triangle_id,
+                start_ns=start_ns,
+                error_msg=(
+                    f"Live Leg 2 ({pair_symbols[2]}) FOK expiration "
+                    f"(Legs 0 and 1 filled, Leg 2 failed)"
+                ),
+                order_plan=order_plan,
+                order_results=order_results,
+                path=path,
+                tickers=tickers,
+            )
+
         duration_ms = (time.time_ns() - start_ns) // 1_000_000
         return ExecutionResult(
             triangle_id=triangle_id,
-            status="SIMULATED",
+            status="FAILED_UNHANDLED",
             expected_net_return=expected_net_return,
-            actual_net_return=expected_net_return,
+            actual_net_return=Decimal("0"),
             execution_duration_ms=duration_ms,
-            legs_filled=3,
+            legs_filled=sum(1 for result in order_results if result.is_filled),
+            error_message="Unexpected live execution state",
         )
+
+    def _build_live_order_plan(
+        self,
+        path: tuple[str, str, str, str],
+        pair_symbols: tuple[str, str, str],
+        tickers: Mapping[str, BookTicker],
+        position_usdt: Decimal,
+    ) -> list[dict[str, Decimal | str]]:
+        """Build the 3 live order requests from the evaluator path and tick snapshot."""
+        amount = position_usdt
+        plan: list[dict[str, Decimal | str]] = []
+
+        for pair_symbol, asset_x, asset_y in zip(pair_symbols, path[:-1], path[1:]):
+            if pair_symbol not in tickers:
+                raise ValueError(f"Missing ticker for live execution symbol {pair_symbol!r}")
+
+            ticker = tickers[pair_symbol]
+            parsed = parse_symbol(pair_symbol)
+            if parsed is None:
+                raise ValueError(f"Could not parse live execution symbol {pair_symbol!r}")
+            base, quote = parsed
+
+            if asset_x == quote and asset_y == base:
+                side = "BUY"
+                price = ticker.ask
+                quantity = amount / price
+                amount = quantity
+            elif asset_x == base and asset_y == quote:
+                side = "SELL"
+                price = ticker.bid
+                quantity = amount
+                amount = quantity * price
+            else:
+                raise ValueError(
+                    f"Pair {pair_symbol} does not connect live path leg {asset_x}->{asset_y}"
+                )
+
+            plan.append(
+                {
+                    "symbol": pair_symbol,
+                    "side": side,
+                    "quantity": quantity,
+                    "price": price,
+                }
+            )
+
+        return plan
+
+    @staticmethod
+    def _asset_to_usdt_rate(asset: str, tickers: Mapping[str, BookTicker]) -> Decimal:
+        """Return the current conversion rate from one asset to USDT."""
+        if asset == "USDT":
+            return Decimal("1")
+
+        for symbol, ticker in tickers.items():
+            parsed = parse_symbol(symbol)
+            if parsed is None:
+                continue
+            base, quote = parsed
+            if base == asset and quote == "USDT":
+                return ticker.bid
+            if base == "USDT" and quote == asset and ticker.ask > Decimal("0"):
+                return Decimal("1") / ticker.ask
+
+        raise ValueError(f"No USDT conversion ticker found for asset {asset!r}")
+
+    def _calculate_live_liquidation_pnl_usdt(
+        self,
+        liquidation_symbol: str,
+        liquidation_side: str,
+        previous_result: OrderResult,
+        liquidation_result: OrderResult,
+        tickers: Mapping[str, BookTicker],
+    ) -> Decimal:
+        """Compute realized liquidation PnL in USDT from the live market order."""
+        parsed = parse_symbol(liquidation_symbol)
+        if parsed is None:
+            raise ValueError(f"Could not parse liquidation symbol {liquidation_symbol!r}")
+        _, quote_asset = parsed
+
+        prev_avg_price = previous_result.avg_price
+        if prev_avg_price <= Decimal("0"):
+            prev_avg_price = Decimal(str(previous_result.raw.get("price") or "0"))
+
+        liq_avg_price = liquidation_result.avg_price
+        if liq_avg_price <= Decimal("0"):
+            liq_avg_price = Decimal(str(liquidation_result.raw.get("price") or "0"))
+
+        if liquidation_side == "SELL":
+            proceeds_quote = liquidation_result.filled_qty * liq_avg_price
+            cost_quote = previous_result.filled_qty * prev_avg_price
+            pnl_quote = proceeds_quote - cost_quote
+        else:
+            proceeds_quote = previous_result.filled_qty * prev_avg_price
+            cost_quote = liquidation_result.filled_qty * liq_avg_price
+            pnl_quote = proceeds_quote - cost_quote
+
+        return pnl_quote * self._asset_to_usdt_rate(quote_asset, tickers)
 
     async def _reconcile_inventory(
         self,
@@ -305,6 +539,10 @@ class Executor:
         triangle_id: str,
         start_ns: int,
         error_msg: str,
+        order_plan: Optional[list[dict[str, Decimal | str]]] = None,
+        order_results: Optional[list[OrderResult]] = None,
+        path: Optional[tuple[str, str, str, str]] = None,
+        tickers: Optional[Mapping[str, BookTicker]] = None,
     ) -> ExecutionResult:
         """Handle partial leg execution failure via emergency market liquidation.
 
@@ -340,16 +578,53 @@ class Executor:
         if failed_leg_index == 1:
             failed_symbol = pair_symbols[1]
             liquidation_symbol = pair_symbols[0]
-            # Emergency market order slippage loss estimate: -0.5% of position
-            liquidation_pnl_usdt = -(position_usdt * Decimal("0.005"))
         else:
             failed_symbol = pair_symbols[2]
             liquidation_symbol = pair_symbols[1]
-            # Emergency market order slippage loss estimate: -1.0% of position
-            liquidation_pnl_usdt = -(position_usdt * Decimal("0.01"))
 
         unhedged_amount = position_usdt
-        actual_net_return = Decimal("1.0") + (liquidation_pnl_usdt / position_usdt)
+
+        if order_plan is None or order_results is None or path is None or tickers is None:
+            # Preserve the Phase 3 dry-run path unchanged.
+            if failed_leg_index == 1:
+                liquidation_pnl_usdt = -(position_usdt * Decimal("0.005"))
+            else:
+                liquidation_pnl_usdt = -(position_usdt * Decimal("0.01"))
+            actual_net_return = Decimal("1.0") + (liquidation_pnl_usdt / position_usdt)
+        else:
+            previous_index = failed_leg_index - 1
+            previous_plan = order_plan[previous_index]
+            previous_result = order_results[previous_index]
+            previous_side = str(previous_plan["side"])
+            liquidation_side = "SELL" if previous_side == "BUY" else "BUY"
+            liquidation_pair_ticker = tickers[liquidation_symbol]
+
+            if liquidation_side == "SELL":
+                liquidation_quantity = previous_result.filled_qty
+            else:
+                quote_received = previous_result.filled_qty * (
+                    previous_result.avg_price if previous_result.avg_price > Decimal("0") else Decimal(str(previous_plan["price"]))
+                )
+                if liquidation_pair_ticker.ask <= Decimal("0"):
+                    raise ValueError(f"Invalid ask price for liquidation symbol {liquidation_symbol!r}")
+                liquidation_quantity = quote_received / liquidation_pair_ticker.ask
+
+            liquidation_result = await self.adapter.place_market_order(
+                symbol=liquidation_symbol,
+                side=liquidation_side,
+                quantity=liquidation_quantity,
+            )
+
+            unhedged_amount = liquidation_result.filled_qty
+
+            liquidation_pnl_usdt = self._calculate_live_liquidation_pnl_usdt(
+                liquidation_symbol=liquidation_symbol,
+                liquidation_side=liquidation_side,
+                previous_result=previous_result,
+                liquidation_result=liquidation_result,
+                tickers=tickers,
+            )
+            actual_net_return = Decimal("1.0") + (liquidation_pnl_usdt / position_usdt)
 
         logger.error(
             "executor_reconciliation_triggered triangle_id='{}' failed_leg={} "

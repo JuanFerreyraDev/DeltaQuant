@@ -419,6 +419,8 @@ class Orchestrator:
                             pair_symbols=res.pair_symbols,
                             position_usdt=self.settings.MAX_POSITION_USDT,
                             expected_net_return=res.net_return,
+                            path=res.path,
+                            tickers=self.cached_tickers,
                         )
                         if (not was_paused_before_exec) and self.risk_manager.is_paused:
                             # Internal pauses (daily-loss/circuit-breaker) must be durable

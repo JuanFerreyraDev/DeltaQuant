@@ -30,7 +30,7 @@ from core.executor import Executor, ExecutionResult
 from core.graph import TradingPair, Triangle, generate_triangles
 from core.risk import RiskManager
 from core.evaluator import evaluate_triangle
-from exchanges.base import BookTicker, TradingFees
+from exchanges.base import BookTicker, OrderResult, TradingFees
 from exchanges.fees import apply_bnb_discount
 from storage.database import DatabaseManager
 
@@ -55,6 +55,26 @@ def settings_dry_run():
 
 
 @pytest.fixture
+def settings_live_testnet():
+    """Settings for live-order tests against Binance TESTNET."""
+    return Settings(
+        BINANCE_API_KEY="test_key_123",
+        BINANCE_API_SECRET="test_secret_456",
+        TESTNET_BINANCE_API_KEY="testnet_key_123",
+        TESTNET_BINANCE_API_SECRET="testnet_secret_456",
+        TELEGRAM_BOT_TOKEN="123:ABC",
+        TELEGRAM_CHAT_ID="999",
+        DRY_RUN=False,
+        BINANCE_TESTNET=True,
+        MAX_POSITION_USDT=Decimal("100"),
+        DAILY_LOSS_LIMIT_USDT=Decimal("-50"),
+        MAX_CONCURRENT_TRIANGLES=2,
+        CIRCUIT_BREAKER_INCIDENT_COUNT=3,
+        CIRCUIT_BREAKER_WINDOW_MINUTES=60,
+    )
+
+
+@pytest.fixture
 def risk_manager(settings_dry_run):
     """Fresh RiskManager using test settings."""
     return RiskManager(settings=settings_dry_run)
@@ -68,6 +88,20 @@ def executor(risk_manager, settings_dry_run):
         risk_manager=risk_manager,
         db_manager=None,
         settings=settings_dry_run,
+    )
+
+
+@pytest.fixture
+def live_executor(settings_live_testnet):
+    """Executor with a mock adapter for live-path tests."""
+    adapter = AsyncMock()
+    adapter.place_fok_order = AsyncMock()
+    adapter.place_market_order = AsyncMock()
+    return Executor(
+        adapter=adapter,
+        risk_manager=RiskManager(settings=settings_live_testnet),
+        db_manager=None,
+        settings=settings_live_testnet,
     )
 
 
@@ -484,3 +518,105 @@ class TestIncidentAlerting:
 
         assert result.status == "FAILED_RECONCILED"
         assert result.legs_filled == 1
+
+
+class TestLiveExecutionWithMarketReconciliation:
+    """Live-path tests that exercise parallel FOK dispatch and market liquidation."""
+
+    @pytest.mark.asyncio
+    async def test_live_success_uses_parallel_fok_orders(self, live_executor, real_pipeline):
+        triangle, tickers, _, best = real_pipeline
+
+        live_executor.adapter.place_fok_order.side_effect = [
+            OrderResult("BTCUSDT", "1", "FILLED", Decimal("0.002"), Decimal("50000"), Decimal("0"), "", {"status": "FILLED"}),
+            OrderResult("ETH/BTC", "2", "FILLED", Decimal("0.04"), Decimal("0.05"), Decimal("0"), "", {"status": "FILLED"}),
+            OrderResult("ETHUSDT", "3", "FILLED", Decimal("0.04"), Decimal("2530"), Decimal("0"), "", {"status": "FILLED"}),
+        ]
+
+        result = await live_executor.execute_triangle(
+            triangle=triangle,
+            pair_symbols=best.pair_symbols,
+            position_usdt=Decimal("100"),
+            expected_net_return=best.net_return,
+            path=best.path,
+            tickers=tickers,
+        )
+
+        assert result.status == "COMPLETED"
+        assert result.legs_filled == 3
+        assert live_executor.adapter.place_fok_order.await_count == 3
+        live_executor.adapter.place_market_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_leg1_failure_triggers_market_reconciliation(self, live_executor, real_pipeline):
+        triangle, tickers, _, best = real_pipeline
+
+        live_executor.adapter.place_fok_order.side_effect = [
+            OrderResult("BTCUSDT", "1", "FILLED", Decimal("0.002"), Decimal("50000"), Decimal("0"), "", {"status": "FILLED"}),
+            OrderResult("ETH/BTC", "2", "EXPIRED", Decimal("0"), Decimal("0"), Decimal("0"), "", {"status": "EXPIRED"}),
+            OrderResult("ETHUSDT", "3", "EXPIRED", Decimal("0"), Decimal("0"), Decimal("0"), "", {"status": "EXPIRED"}),
+        ]
+        live_executor.adapter.place_market_order.return_value = OrderResult(
+            "BTCUSDT",
+            "liq-1",
+            "FILLED",
+            Decimal("0.002"),
+            Decimal("49920"),
+            Decimal("0"),
+            "",
+            {"status": "FILLED"},
+        )
+
+        result = await live_executor.execute_triangle(
+            triangle=triangle,
+            pair_symbols=best.pair_symbols,
+            position_usdt=Decimal("100"),
+            expected_net_return=best.net_return,
+            path=best.path,
+            tickers=tickers,
+        )
+
+        assert result.status == "FAILED_RECONCILED"
+        assert result.legs_filled == 1
+        live_executor.adapter.place_market_order.assert_awaited_once()
+        market_kwargs = live_executor.adapter.place_market_order.await_args.kwargs
+        assert market_kwargs["symbol"] == "BTCUSDT"
+        assert market_kwargs["side"] == "SELL"
+        assert market_kwargs["quantity"] == Decimal("0.002")
+
+    @pytest.mark.asyncio
+    async def test_live_leg2_failure_triggers_market_reconciliation(self, live_executor, real_pipeline):
+        triangle, tickers, _, best = real_pipeline
+
+        live_executor.adapter.place_fok_order.side_effect = [
+            OrderResult("BTCUSDT", "1", "FILLED", Decimal("0.002"), Decimal("50000"), Decimal("0"), "", {"status": "FILLED"}),
+            OrderResult("ETH/BTC", "2", "FILLED", Decimal("0.04"), Decimal("0.05"), Decimal("0"), "", {"status": "FILLED"}),
+            OrderResult("ETHUSDT", "3", "EXPIRED", Decimal("0"), Decimal("0"), Decimal("0"), "", {"status": "EXPIRED"}),
+        ]
+        live_executor.adapter.place_market_order.return_value = OrderResult(
+            "ETH/BTC",
+            "liq-2",
+            "FILLED",
+            Decimal("0.04"),
+            Decimal("0.0497"),
+            Decimal("0"),
+            "",
+            {"status": "FILLED"},
+        )
+
+        result = await live_executor.execute_triangle(
+            triangle=triangle,
+            pair_symbols=best.pair_symbols,
+            position_usdt=Decimal("100"),
+            expected_net_return=best.net_return,
+            path=best.path,
+            tickers=tickers,
+        )
+
+        assert result.status == "FAILED_RECONCILED"
+        assert result.legs_filled == 2
+        live_executor.adapter.place_market_order.assert_awaited_once()
+        market_kwargs = live_executor.adapter.place_market_order.await_args.kwargs
+        assert market_kwargs["symbol"] == "ETH/BTC"
+        assert market_kwargs["side"] == "SELL"
+        assert market_kwargs["quantity"] == Decimal("0.04")
