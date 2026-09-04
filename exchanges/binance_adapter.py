@@ -181,6 +181,129 @@ def _log_weight(client: ccxt.binance, operation: str) -> None:
         )
 
 
+def _decimal_or_none(value: object) -> Optional[Decimal]:
+    """Convert a raw value to Decimal when possible."""
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """Round a Decimal value down to the nearest allowed step."""
+    if step <= Decimal("0"):
+        return value
+    return (value // step) * step
+
+
+def _extract_filter_decimal(filters: list[dict], filter_type: str, key: str) -> Optional[Decimal]:
+    for entry in filters:
+        if entry.get("filterType") == filter_type and entry.get(key) is not None:
+            return _decimal_or_none(entry.get(key))
+    return None
+
+
+def _extract_market_rules(market: dict) -> dict[str, Optional[Decimal]]:
+    """Extract Binance lot/tick/min-notional values from a ccxt market dict."""
+    filters = market.get("info", {}).get("filters", []) or []
+    amount_step = (
+        _extract_filter_decimal(filters, "MARKET_LOT_SIZE", "stepSize")
+        or _extract_filter_decimal(filters, "LOT_SIZE", "stepSize")
+    )
+    price_tick = _extract_filter_decimal(filters, "PRICE_FILTER", "tickSize")
+    min_notional = (
+        _extract_filter_decimal(filters, "NOTIONAL", "minNotional")
+        or _extract_filter_decimal(filters, "MIN_NOTIONAL", "minNotional")
+    )
+
+    if amount_step is None:
+        amount_precision = market.get("precision", {}).get("amount")
+        if amount_precision is not None:
+            amount_step = Decimal("1").scaleb(-int(amount_precision))
+
+    if price_tick is None:
+        price_precision = market.get("precision", {}).get("price")
+        if price_precision is not None:
+            price_tick = Decimal("1").scaleb(-int(price_precision))
+
+    return {
+        "amount_step": amount_step,
+        "price_tick": price_tick,
+        "min_notional": min_notional,
+    }
+
+
+def _extract_order_status(raw: dict, filled_qty: Decimal) -> str:
+    """Map a ccxt/Binance response status to the canonical order status string."""
+    info = raw.get("info") or {}
+    status = info.get("status") or raw.get("status") or "UNKNOWN"
+    status_text = str(status).upper()
+    if status_text == "CLOSED":
+        return "FILLED" if filled_qty > Decimal("0") else "CANCELED"
+    if status_text == "CANCELLED":
+        return "CANCELED"
+    return status_text
+
+
+def _extract_order_fee(raw: dict) -> tuple[Decimal, str]:
+    """Extract fee cost / asset from a ccxt order response."""
+    fee = raw.get("fee") or {}
+    if fee.get("cost") is not None:
+        return _decimal_or_none(fee.get("cost")) or Decimal("0"), str(fee.get("currency") or "")
+
+    fees = raw.get("fees") or []
+    if fees:
+        total = Decimal("0")
+        fee_asset = ""
+        for entry in fees:
+            cost = _decimal_or_none(entry.get("cost"))
+            if cost is not None:
+                total += cost
+            if not fee_asset and entry.get("currency"):
+                fee_asset = str(entry.get("currency"))
+        return total, fee_asset
+
+    return Decimal("0"), ""
+
+
+def _order_result_from_raw(symbol: str, raw: dict) -> OrderResult:
+    """Convert a ccxt create_order payload into an OrderResult."""
+    filled_qty = (
+        _decimal_or_none(raw.get("filled"))
+        or _decimal_or_none(raw.get("executedQty"))
+        or _decimal_or_none(raw.get("amount"))
+        or Decimal("0")
+    )
+
+    avg_price = (
+        _decimal_or_none(raw.get("average"))
+        or _decimal_or_none(raw.get("avgPrice"))
+        or _decimal_or_none(raw.get("price"))
+    )
+    if avg_price is None or avg_price <= Decimal("0"):
+        cost = _decimal_or_none(raw.get("cost"))
+        if cost is not None and filled_qty > Decimal("0"):
+            avg_price = cost / filled_qty
+        else:
+            avg_price = Decimal("0")
+
+    fee, fee_asset = _extract_order_fee(raw)
+    status = _extract_order_status(raw, filled_qty)
+
+    return OrderResult(
+        symbol=symbol,
+        order_id=str(raw.get("id") or raw.get("orderId") or raw.get("clientOrderId") or ""),
+        status=status,
+        filled_qty=filled_qty,
+        avg_price=avg_price,
+        fee=fee,
+        fee_asset=fee_asset,
+        raw=dict(raw),
+    )
+
+
 class BinanceAdapter(ExchangeAdapter):
     """Binance implementation of ``ExchangeAdapter``.
 
@@ -261,21 +384,27 @@ class BinanceAdapter(ExchangeAdapter):
         loop = asyncio.get_running_loop()
 
         def _build_and_load() -> ccxt.binance:
+            api_key = settings.TESTNET_BINANCE_API_KEY if settings.BINANCE_TESTNET else settings.BINANCE_API_KEY
+            api_secret = (
+                settings.TESTNET_BINANCE_API_SECRET
+                if settings.BINANCE_TESTNET
+                else settings.BINANCE_API_SECRET
+            )
             client = ccxt.binance(
                 {
-                    "apiKey": settings.BINANCE_API_KEY,
-                    "secret": settings.BINANCE_API_SECRET,
+                    "apiKey": api_key,
+                    "secret": api_secret,
                     # Enable rate-limit tracking: ccxt will throttle requests
                     # automatically to stay within Binance weight limits.
                     "enableRateLimit": True,
-                    # Use the production endpoint; testnet can be toggled here
-                    # for integration testing without real capital.
                     "options": {
                         "defaultType": "spot",
                         "adjustForTimeDifference": True,
                     },
                 }
             )
+            if settings.BINANCE_TESTNET:
+                client.set_sandbox_mode(True)
             # load_markets() makes a real REST request to Binance.
             # This is the connectivity + credential check: an invalid API key
             # or unreachable host raises here, not on the first operational call.
@@ -285,6 +414,11 @@ class BinanceAdapter(ExchangeAdapter):
         client = await loop.run_in_executor(None, _build_and_load)
         _log_weight(client, "create/load_markets")
         adapter = cls(client, settings, ws_client=None)
+        logger.warning(
+            f"binance_adapter_startup mode={'TESTNET' if settings.BINANCE_TESTNET else 'PRODUCTION'} "
+            f"dry_run={settings.DRY_RUN} "
+            f"live_order_gate={'ENABLED' if (not settings.DRY_RUN and settings.BINANCE_TESTNET) else 'BLOCKED'}"
+        )
         # Pre-populate the instance cache from the already-loaded markets so
         # the first get_markets() call is free.
         adapter._markets_cache = client.markets
@@ -406,6 +540,8 @@ class BinanceAdapter(ExchangeAdapter):
                     },
                 }
             )
+            if self._settings.BINANCE_TESTNET:
+                self._ws_client.set_sandbox_mode(True)
             logger.info(
                 "binance_ws connect symbols=%s",
                 len(unified_symbols),
@@ -570,14 +706,11 @@ class BinanceAdapter(ExchangeAdapter):
         quantity: Decimal,
         price: Decimal,
     ) -> OrderResult:
-        """Place a Fill-or-Kill order on Binance (Phase 3).
+        """Place a Fill-or-Kill limit order on Binance TESTNET.
 
-        Not implemented in Phase 1 or Phase 2.  FOK order dispatch is
-        introduced in Phase 3 (``feature/f3-executor-parallel-dryrun``),
-        initially in DRY_RUN mode, and goes live in Phase 5.
-
-        **Symbol format**: accepts native format symbols (e.g. ``"BTCUSDT"``)
-        and will convert to unified format internally for ccxt calls (see ADR-002).
+        Live order placement is deliberately blocked unless ``DRY_RUN`` is
+        False and ``BINANCE_TESTNET`` is True.  That combination is the only
+        allowed live-order mode in this stage.
 
         Args:
             symbol: Symbol string from the engine — concatenated USDT pair
@@ -587,13 +720,130 @@ class BinanceAdapter(ExchangeAdapter):
             quantity: Base-asset quantity.
             price: Limit price in quote-asset units.
 
+        Returns:
+            ``OrderResult`` with the exact exchange order status, fill qty,
+            average price, and fee fields.
+
         Raises:
-            NotImplementedError: Always, in Phase 1.
+            ValueError: For invalid side or filter violations.
+            PermissionError: If live order placement is not allowed.
         """
-        raise NotImplementedError(
-            "place_fok_order is implemented in Phase 3 "
-            "(feature/f3-executor-parallel-dryrun)."
-        )
+        if self._settings.DRY_RUN or not self._settings.BINANCE_TESTNET:
+            raise PermissionError(
+                "Live order placement requires DRY_RUN=False and BINANCE_TESTNET=True."
+            )
+
+        side_upper = side.upper()
+        if side_upper not in {"BUY", "SELL"}:
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+
+        unified_symbol = _native_to_unified(symbol)
+        markets = await self.get_markets()
+        market = markets.get(unified_symbol)
+        if market is None:
+            raise ValueError(f"Unknown market for symbol {symbol!r}")
+
+        rules = _extract_market_rules(market)
+        amount_step = rules["amount_step"]
+        price_tick = rules["price_tick"]
+        min_notional = rules["min_notional"]
+
+        norm_qty = _floor_to_step(quantity, amount_step) if amount_step else quantity
+        norm_price = _floor_to_step(price, price_tick) if price_tick else price
+
+        if norm_qty <= Decimal("0"):
+            raise ValueError(f"quantity {quantity} is below the market lot size for {symbol!r}")
+        if norm_price <= Decimal("0"):
+            raise ValueError(f"price {price} is below the tick size for {symbol!r}")
+        if min_notional is not None and (norm_qty * norm_price) < min_notional:
+            raise ValueError(
+                f"order notional {norm_qty * norm_price} is below min_notional {min_notional} for {symbol!r}"
+            )
+
+        loop = asyncio.get_running_loop()
+
+        def _submit() -> dict:
+            return self._client.create_order(
+                unified_symbol,
+                "limit",
+                side_upper.lower(),
+                str(norm_qty),
+                str(norm_price),
+                {"timeInForce": "FOK"},
+            )
+
+        raw: dict = await loop.run_in_executor(None, _submit)
+        _log_weight(self._client, f"place_fok_order:{symbol}")
+        return _order_result_from_raw(symbol, raw)
+
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+    ) -> OrderResult:
+        """Place a market order on Binance TESTNET.
+
+        Market orders are used only for emergency reconciliation after a FOK
+        leg has already failed and inventory must be unwound immediately.
+
+        Raises:
+            ValueError: For invalid side or filter violations.
+            PermissionError: If live order placement is not allowed.
+        """
+        if self._settings.DRY_RUN or not self._settings.BINANCE_TESTNET:
+            raise PermissionError(
+                "Live order placement requires DRY_RUN=False and BINANCE_TESTNET=True."
+            )
+
+        side_upper = side.upper()
+        if side_upper not in {"BUY", "SELL"}:
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+
+        unified_symbol = _native_to_unified(symbol)
+        markets = await self.get_markets()
+        market = markets.get(unified_symbol)
+        if market is None:
+            raise ValueError(f"Unknown market for symbol {symbol!r}")
+
+        rules = _extract_market_rules(market)
+        amount_step = rules["amount_step"]
+        min_notional = rules["min_notional"]
+        norm_qty = _floor_to_step(quantity, amount_step) if amount_step else quantity
+
+        if norm_qty <= Decimal("0"):
+            raise ValueError(f"quantity {quantity} is below the market lot size for {symbol!r}")
+
+        # Validate market-notional safety against a fresh ticker snapshot.
+        loop = asyncio.get_running_loop()
+
+        def _fetch_ticker() -> dict:
+            return self._client.fetch_ticker(unified_symbol)
+
+        ticker: dict = await loop.run_in_executor(None, _fetch_ticker)
+        _log_weight(self._client, f"fetch_ticker_for_market_order:{symbol}")
+
+        reference_price = _decimal_or_none(ticker.get("ask") if side_upper == "BUY" else ticker.get("bid"))
+        if reference_price is None or reference_price <= Decimal("0"):
+            reference_price = _decimal_or_none(ticker.get("last"))
+
+        if min_notional is not None and reference_price is not None:
+            if (norm_qty * reference_price) < min_notional:
+                raise ValueError(
+                    f"market order notional {norm_qty * reference_price} is below min_notional {min_notional} for {symbol!r}"
+                )
+
+        def _submit() -> dict:
+            return self._client.create_order(
+                unified_symbol,
+                "market",
+                side_upper.lower(),
+                str(norm_qty),
+            )
+
+        raw: dict = await loop.run_in_executor(None, _submit)
+        _log_weight(self._client, f"place_market_order:{symbol}")
+        return _order_result_from_raw(symbol, raw)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

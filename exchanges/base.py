@@ -234,9 +234,11 @@ class ExchangeAdapter(ABC):
         fill.  This property is what makes FOK suitable for the triangle legs:
         a partial fill would leave the bot with unplanned inventory.
 
-        In ``DRY_RUN`` mode, concrete implementations must simulate the order
-        result against the live book without sending a real request to the
-        exchange.
+        Live order placement is only allowed when the adapter has been
+        intentionally configured for Binance TESTNET and the caller is not in
+        ``DRY_RUN`` mode.  If the adapter is misconfigured, concrete
+        implementations must fail closed rather than attempting a production
+        order.
 
         Args:
             symbol: Exchange-native symbol string, e.g. ``"BTCUSDT"``.
@@ -255,6 +257,43 @@ class ExchangeAdapter(ABC):
             ValueError: If ``side`` is not ``"BUY"`` or ``"SELL"``, or if
                 ``quantity``/``price`` violate exchange filter rules.
             PermissionError: If the API key does not have trading permissions.
+        """
+
+    @abstractmethod
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+    ) -> OrderResult:
+        """Place a market order at the best available price.
+
+        Market orders trade price certainty for execution certainty: there is
+        no guaranteed fill price, but barring a fully empty book the order is
+        expected to execute immediately.  That property makes market orders
+        the correct tool for emergency reconciliation after a FOK leg already
+        failed once due to movement in the top of book.
+
+        Like ``place_fok_order``, live execution is only allowed when the
+        adapter is explicitly configured for Binance TESTNET and the caller is
+        not in ``DRY_RUN`` mode.  Misconfiguration must fail closed.
+
+        Args:
+            symbol: Exchange-native symbol string, e.g. ``"BTCUSDT"``.
+            side: ``"BUY"`` or ``"SELL"`` (uppercase).
+            quantity: Base-asset quantity to trade, expressed with the
+                precision required by the exchange's market-lot filter.
+
+        Returns:
+            ``OrderResult`` describing the final state of the order.
+            ``OrderResult.is_filled`` is still the primary success signal for
+            the executor, even though market orders may return partial or
+            unexpected exchange statuses in edge cases.
+
+        Raises:
+            ValueError: If ``side`` is invalid or ``quantity`` violates the
+                exchange's filter rules.
+            PermissionError: If live order placement is not enabled.
         """
 
     async def close(self) -> None:

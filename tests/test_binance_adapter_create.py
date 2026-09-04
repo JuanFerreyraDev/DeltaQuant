@@ -40,6 +40,20 @@ def _make_settings() -> Settings:
     )
 
 
+def _make_testnet_settings() -> Settings:
+    """Return Settings configured for Binance TESTNET live-order mode."""
+    return Settings(
+        BINANCE_API_KEY="real_key_abc123",
+        BINANCE_API_SECRET="real_secret_xyz789",
+        BINANCE_TESTNET=True,
+        TESTNET_BINANCE_API_KEY="testnet_key_abc123",
+        TESTNET_BINANCE_API_SECRET="testnet_secret_xyz789",
+        TELEGRAM_BOT_TOKEN="111:AAA",
+        TELEGRAM_CHAT_ID="123",
+        DRY_RUN=False,
+    )
+
+
 def _mock_ccxt_client(markets: dict | None = None) -> MagicMock:
     """Build a MagicMock that mimics a ccxt.binance instance.
 
@@ -152,3 +166,22 @@ class TestBinanceAdapterCreate:
             await adapter.get_markets()
 
         fake_client.load_markets.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_uses_testnet_credentials_and_sandbox_mode(self, caplog):
+        """BINANCE_TESTNET=True switches the adapter to testnet credentials and sandbox mode."""
+        fake_client = _mock_ccxt_client()
+        fake_client.set_sandbox_mode = MagicMock()
+        settings = _make_testnet_settings()
+
+        with patch("exchanges.binance_adapter.ccxt.binance", return_value=fake_client) as ctor:
+            with caplog.at_level("WARNING", logger="exchanges.binance_adapter"):
+                adapter = await BinanceAdapter.create(settings)
+
+        ctor.assert_called_once()
+        ctor_kwargs = ctor.call_args.args[0]
+        assert ctor_kwargs["apiKey"] == settings.TESTNET_BINANCE_API_KEY
+        assert ctor_kwargs["secret"] == settings.TESTNET_BINANCE_API_SECRET
+        fake_client.set_sandbox_mode.assert_called_once_with(True)
+        assert adapter._settings.BINANCE_TESTNET is True
+        assert any("mode=TESTNET" in record.message for record in caplog.records)
