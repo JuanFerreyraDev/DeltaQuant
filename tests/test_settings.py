@@ -164,6 +164,11 @@ class TestDefaults:
         s = _make()
         assert s.DRY_RUN is True
 
+    def test_binance_testnet_defaults_false(self):
+        """BINANCE_TESTNET defaults to False so live testnet orders stay opt-in."""
+        s = _make()
+        assert s.BINANCE_TESTNET is False
+
     def test_numeric_defaults_are_sane(self):
         """Spot-check a handful of defaults to guard against accidental changes."""
         s = _make()
@@ -213,3 +218,33 @@ class TestGetSettings:
         assert s2.LOG_LEVEL == "ERROR"
         assert s2 is not s1
         get_settings.cache_clear()
+
+
+class TestTestnetMode:
+    def test_testnet_requires_credentials(self):
+        """Enabling BINANCE_TESTNET without dedicated credentials raises ValidationError."""
+        with pytest.raises(ValidationError):
+            _make(
+                BINANCE_TESTNET=True,
+                TESTNET_BINANCE_API_KEY="",
+                TESTNET_BINANCE_API_SECRET="",
+            )
+
+    def test_testnet_accepts_credentials(self):
+        """BINANCE_TESTNET=True requires explicit testnet API key and secret."""
+        s = _make(
+            BINANCE_TESTNET=True,
+            TESTNET_BINANCE_API_KEY="testnet_key_123",
+            TESTNET_BINANCE_API_SECRET="testnet_secret_456",
+        )
+        assert s.BINANCE_TESTNET is True
+        assert s.TESTNET_BINANCE_API_KEY == "testnet_key_123"
+        assert s.TESTNET_BINANCE_API_SECRET == "testnet_secret_456"
+
+    def test_live_mode_requires_testnet_in_this_stage(self):
+        """DRY_RUN=False and BINANCE_TESTNET=False must fail closed at startup."""
+        with pytest.raises(ValidationError):
+            _make(
+                DRY_RUN=False,
+                BINANCE_TESTNET=False,
+            )

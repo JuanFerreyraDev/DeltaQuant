@@ -19,7 +19,7 @@ Environment:
 from decimal import Decimal
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,6 +34,12 @@ class Settings(BaseSettings):
         BINANCE_API_KEY: Binance REST/WS API key.  Spot-trading permissions
             only; withdrawal permission must NOT be enabled.
         BINANCE_API_SECRET: Corresponding API secret.
+        BINANCE_TESTNET: When True, the adapter uses Binance TESTNET endpoints
+            and requires the separate testnet API credentials below.
+        TESTNET_BINANCE_API_KEY: Binance TESTNET API key (required when
+            BINANCE_TESTNET=True).
+        TESTNET_BINANCE_API_SECRET: Binance TESTNET API secret (required when
+            BINANCE_TESTNET=True).
         DRY_RUN: When True, order placement is simulated against live prices
             without sending real orders to the exchange.
         MIN_VOLUME_USDT: Minimum 24-hour USDT-equivalent volume a trading pair
@@ -77,6 +83,18 @@ class Settings(BaseSettings):
     BINANCE_API_SECRET: str = Field(
         ...,
         description="Binance API secret.",
+    )
+    BINANCE_TESTNET: bool = Field(
+        default=False,
+        description="Use Binance TESTNET endpoints and credentials for live orders.",
+    )
+    TESTNET_BINANCE_API_KEY: str | None = Field(
+        default=None,
+        description="Binance TESTNET API key (required when BINANCE_TESTNET=True).",
+    )
+    TESTNET_BINANCE_API_SECRET: str | None = Field(
+        default=None,
+        description="Binance TESTNET API secret (required when BINANCE_TESTNET=True).",
     )
 
     # ── Trading behaviour ─────────────────────────────────────────────────────
@@ -209,6 +227,38 @@ class Settings(BaseSettings):
                 "Set a real value in .env (never commit .env)."
             )
         return value
+
+    @model_validator(mode="after")
+    def validate_testnet_credentials(self) -> "Settings":
+        """Require Binance TESTNET credentials whenever testnet mode is enabled."""
+        if self.BINANCE_TESTNET:
+            for field_name in ("TESTNET_BINANCE_API_KEY", "TESTNET_BINANCE_API_SECRET"):
+                value = getattr(self, field_name)
+                if value is None or value.strip() == "":
+                    raise ValueError(
+                        f"{field_name} is required when BINANCE_TESTNET=True."
+                    )
+                lower = value.lower()
+                if "your_" in lower or "placeholder" in lower:
+                    raise ValueError(
+                        f"{field_name} appears to be a placeholder. Set a real Binance TESTNET credential."
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def validate_live_mode_gate(self) -> "Settings":
+        """Fail closed for unsupported live-trading mode combinations.
+
+        In Phase 5 Stage 1, the only valid live-order configuration is:
+            DRY_RUN=False and BINANCE_TESTNET=True
+        Any other live combination must fail at settings construction time.
+        """
+        if (not self.DRY_RUN) and (not self.BINANCE_TESTNET):
+            raise ValueError(
+                "Invalid live mode configuration: DRY_RUN=False requires "
+                "BINANCE_TESTNET=True in this stage."
+            )
+        return self
 
 
 @lru_cache(maxsize=1)
