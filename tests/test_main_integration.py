@@ -3,6 +3,7 @@
 import asyncio
 from decimal import Decimal
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +17,33 @@ from exchanges.base import BookTicker, TradingFees
 from main import Orchestrator
 from storage.database import DatabaseManager
 from storage.models import Metric
+from storage.redis_client import RedisControlPlaneClient
+
+
+class _FakeRedis:
+    """Simple in-memory async Redis stand-in for integration tests."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+
+    async def ping(self) -> bool:
+        return True
+
+    async def get(self, key: str):
+        return self._store.get(key)
+
+    async def set(self, key: str, value: str) -> bool:
+        self._store[key] = value
+        return True
+
+    async def setnx(self, key: str, value: str) -> bool:
+        if key in self._store:
+            return False
+        self._store[key] = value
+        return True
+
+    async def aclose(self) -> None:
+        return None
 
 
 @pytest.fixture
@@ -375,4 +403,290 @@ async def test_refresh_triangles_first_call_does_not_set_resubscribe_event(
 
     assert orchestrator.subscribed_symbols == {"ETH/BTC", "ETHUSDT", "BTCUSDT"}
     assert not orchestrator._resubscribe_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_process_tick_does_not_query_redis_per_tick(
+    mock_adapter, db_manager, risk_manager, executor, test_settings, monkeypatch
+):
+    """Tick processing never calls Redis, keeping control-plane out of hot path."""
+    redis_backend = _FakeRedis()
+    redis_client = RedisControlPlaneClient(redis_backend)
+    await redis_client.connect()
+    redis_client.get_trading_enabled = AsyncMock(return_value=True)
+
+    orchestrator = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+        redis_client=redis_client,
+    )
+    await orchestrator.refresh_triangles()
+
+    monkeypatch.setattr("main.evaluate_triangle", lambda **kwargs: [])
+
+    now_ms = int(time.time() * 1000)
+    await orchestrator._process_tick(
+        BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms)
+    )
+
+    redis_client.get_trading_enabled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_changes_real_execution_behavior(
+    mock_adapter, db_manager, risk_manager, executor, test_settings, monkeypatch
+):
+    """After Redis kill-sync, the next profitable attempt is blocked end-to-end."""
+    redis_backend = _FakeRedis()
+    redis_client = RedisControlPlaneClient(redis_backend)
+    await redis_client.connect()
+
+    orchestrator = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+        redis_client=redis_client,
+    )
+    await orchestrator.refresh_triangles()
+    triangle = orchestrator.active_triangles[0]
+
+    profitable = SimpleNamespace(
+        is_profitable=True,
+        triangle=triangle,
+        net_return=Decimal("1.01"),
+        max_age_ms=1,
+        path=("USDT", "BTC", "ETH", "USDT"),
+        pair_symbols=("BTCUSDT", "ETH/BTC", "ETHUSDT"),
+    )
+    monkeypatch.setattr("main.evaluate_triangle", lambda **kwargs: [profitable])
+    executor.execute_triangle = AsyncMock()
+
+    now_ms = int(time.time() * 1000)
+    orchestrator.cached_tickers = {
+        "BTCUSDT": BookTicker("BTCUSDT", Decimal("50000"), Decimal("50010"), now_ms),
+        "ETHUSDT": BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms),
+        "ETH/BTC": BookTicker("ETH/BTC", Decimal("0.06"), Decimal("0.0601"), now_ms),
+    }
+
+    await orchestrator._process_tick(
+        BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms)
+    )
+    assert executor.execute_triangle.await_count == 1
+
+    await redis_client.set_trading_enabled(False, pause_reason="[control-plane] Operator command /kill")
+    await orchestrator._sync_control_plane_once()
+
+    await orchestrator._process_tick(
+        BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms + 1)
+    )
+    assert executor.execute_triangle.await_count == 1
+    assert risk_manager.is_paused is True
+
+
+@pytest.mark.asyncio
+async def test_kill_state_persists_across_restart_simulation(
+    mock_adapter, db_manager, executor, test_settings, monkeypatch
+):
+    """Kill in process A remains enforced after process B startup sync."""
+    redis_backend = _FakeRedis()
+    redis_client_a = RedisControlPlaneClient(redis_backend)
+    await redis_client_a.connect()
+
+    risk_a = RiskManager(settings=test_settings)
+    orchestrator_a = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_a,
+        executor=executor,
+        settings=test_settings,
+        redis_client=redis_client_a,
+    )
+    await orchestrator_a.handle_control_action(
+        enabled=False,
+        reason="[control-plane] Operator command /kill",
+        force_resume=False,
+    )
+
+    redis_client_b = RedisControlPlaneClient(redis_backend)
+    risk_b = RiskManager(settings=test_settings)
+    executor_b = AsyncMock()
+
+    orchestrator_b = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_b,
+        executor=executor,
+        settings=test_settings,
+        redis_client=redis_client_b,
+    )
+    await orchestrator_b.refresh_triangles()
+    await orchestrator_b._sync_control_plane_once()
+
+    assert risk_b.is_paused is True
+
+    triangle = orchestrator_b.active_triangles[0]
+    profitable = SimpleNamespace(
+        is_profitable=True,
+        triangle=triangle,
+        net_return=Decimal("1.01"),
+        max_age_ms=1,
+        path=("USDT", "BTC", "ETH", "USDT"),
+        pair_symbols=("BTCUSDT", "ETH/BTC", "ETHUSDT"),
+    )
+    monkeypatch.setattr("main.evaluate_triangle", lambda **kwargs: [profitable])
+    executor.execute_triangle = executor_b
+
+    now_ms = int(time.time() * 1000)
+    orchestrator_b.cached_tickers = {
+        "BTCUSDT": BookTicker("BTCUSDT", Decimal("50000"), Decimal("50010"), now_ms),
+        "ETHUSDT": BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms),
+        "ETH/BTC": BookTicker("ETH/BTC", Decimal("0.06"), Decimal("0.0601"), now_ms),
+    }
+
+    await orchestrator_b._process_tick(
+        BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms)
+    )
+    executor_b.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_pause_state_and_reason(
+    mock_adapter, db_manager, risk_manager, executor, test_settings
+):
+    """Resume clears both is_paused and pause_reason via control-plane action."""
+    redis_backend = _FakeRedis()
+    redis_client = RedisControlPlaneClient(redis_backend)
+    await redis_client.connect()
+
+    orchestrator = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+        redis_client=redis_client,
+    )
+
+    await orchestrator.handle_control_action(
+        enabled=False,
+        reason="[control-plane] Operator command /kill",
+        force_resume=False,
+    )
+    assert risk_manager.is_paused is True
+
+    await orchestrator.handle_control_action(
+        enabled=True,
+        reason="[control-plane] Operator command /resume",
+        force_resume=True,
+    )
+
+    assert risk_manager.is_paused is False
+    assert risk_manager.pause_reason is None
+    assert await redis_client.get_trading_enabled() is True
+    assert await redis_client.get_pause_reason() == ""
+
+
+@pytest.mark.asyncio
+async def test_internal_pause_is_persisted_immediately_and_survives_restart(
+    mock_adapter, db_manager, risk_manager, executor, test_settings, monkeypatch
+):
+    """Circuit-breaker pause is written to Redis immediately, then restored after restart.
+
+    This simulates three reconciliation incidents produced by execution logic and
+    verifies there is no poll-interval gap before Redis durability.
+    """
+    redis_backend = _FakeRedis()
+    redis_client = RedisControlPlaneClient(redis_backend)
+    await redis_client.connect()
+
+    orchestrator = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+        redis_client=redis_client,
+    )
+    await orchestrator.refresh_triangles()
+    await orchestrator._sync_control_plane_once()
+    assert await redis_client.get_trading_enabled() is True
+
+    triangle = orchestrator.active_triangles[0]
+    profitable = SimpleNamespace(
+        is_profitable=True,
+        triangle=triangle,
+        net_return=Decimal("1.01"),
+        max_age_ms=1,
+        path=("USDT", "BTC", "ETH", "USDT"),
+        pair_symbols=("BTCUSDT", "ETH/BTC", "ETHUSDT"),
+    )
+    monkeypatch.setattr("main.evaluate_triangle", lambda **kwargs: [profitable])
+
+    async def _simulate_three_reconciliation_incidents(**kwargs):
+        risk_manager.record_incident()
+        risk_manager.record_incident()
+        risk_manager.record_incident()
+        return None
+
+    executor.execute_triangle = AsyncMock(side_effect=_simulate_three_reconciliation_incidents)
+
+    now_ms = int(time.time() * 1000)
+    orchestrator.cached_tickers = {
+        "BTCUSDT": BookTicker("BTCUSDT", Decimal("50000"), Decimal("50010"), now_ms),
+        "ETHUSDT": BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms),
+        "ETH/BTC": BookTicker("ETH/BTC", Decimal("0.06"), Decimal("0.0601"), now_ms),
+    }
+
+    await orchestrator._process_tick(
+        BookTicker("ETHUSDT", Decimal("3000"), Decimal("3001"), now_ms)
+    )
+
+    assert risk_manager.is_paused is True
+    assert await redis_client.get_trading_enabled() is False
+
+    restarted_risk = RiskManager(settings=test_settings)
+    restarted_orchestrator = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=restarted_risk,
+        executor=executor,
+        settings=test_settings,
+        redis_client=RedisControlPlaneClient(redis_backend),
+    )
+    await restarted_orchestrator._sync_control_plane_once()
+    assert restarted_risk.is_paused is True
+
+
+@pytest.mark.asyncio
+async def test_telegram_start_failure_is_fatal(
+    mock_adapter, db_manager, risk_manager, executor, test_settings
+):
+    """Orchestrator fails fast if Telegram control-plane cannot start."""
+    async def _idle_stream(symbols):
+        while True:
+            await asyncio.sleep(10)
+            yield BookTicker(symbols[0], Decimal("100"), Decimal("101"), int(time.time() * 1000))
+
+    mock_adapter.subscribe_book_ticker = MagicMock(side_effect=_idle_stream)
+
+    telegram_bot = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("bad token")),
+        stop=AsyncMock(),
+    )
+    orchestrator = Orchestrator(
+        adapter=mock_adapter,
+        db_manager=db_manager,
+        risk_manager=risk_manager,
+        executor=executor,
+        settings=test_settings,
+        telegram_bot=telegram_bot,
+    )
+
+    with pytest.raises(RuntimeError, match="bad token"):
+        await asyncio.wait_for(orchestrator.start(), timeout=3)
 

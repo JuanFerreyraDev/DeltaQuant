@@ -56,6 +56,7 @@ class Settings(BaseSettings):
             evaluation hot path.
         REDIS_PORT: Redis TCP port.
         REDIS_DB: Redis logical database index.
+        CONTROL_PLANE_POLL_INTERVAL_SECONDS: Redis poll interval for kill-switch state.
         TELEGRAM_BOT_TOKEN: Token for the python-telegram-bot interface.
         TELEGRAM_CHAT_ID: Destination chat for alerts and control commands.
         LOG_LEVEL: Loguru log level (DEBUG, INFO, WARNING, ERROR).
@@ -140,6 +141,11 @@ class Settings(BaseSettings):
     REDIS_HOST: str = Field(default="localhost")
     REDIS_PORT: int = Field(default=6379, gt=0, le=65535)
     REDIS_DB: int = Field(default=0, ge=0)
+    CONTROL_PLANE_POLL_INTERVAL_SECONDS: int = Field(
+        default=2,
+        gt=0,
+        description="Fixed Redis polling cadence for control-plane state sync.",
+    )
 
     # ── Telegram ─────────────────────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN: str = Field(

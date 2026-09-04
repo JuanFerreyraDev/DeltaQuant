@@ -23,7 +23,7 @@ Design contract — pair_symbols ordering:
 from dataclasses import dataclass
 from decimal import Decimal
 import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 
@@ -77,6 +77,7 @@ class Executor:
         risk_manager: RiskManager,
         db_manager: Optional[DatabaseManager] = None,
         settings: Optional[Settings] = None,
+        incident_alert_sender: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> None:
         """Initialize the Executor engine.
 
@@ -85,11 +86,13 @@ class Executor:
             risk_manager: Risk manager instance.
             db_manager: Database manager instance for recording trades and incidents.
             settings: Settings instance.
+            incident_alert_sender: Optional async callback for incident alerts.
         """
         self.adapter = adapter
         self.risk_manager = risk_manager
         self.db_manager = db_manager
         self.settings = settings or get_settings()
+        self.incident_alert_sender = incident_alert_sender
 
     async def execute_triangle(
         self,
@@ -359,7 +362,9 @@ class Executor:
         )
 
         # Record incident in RiskManager (may trigger circuit breaker)
+        paused_before = self.risk_manager.is_paused
         self.risk_manager.record_incident(timestamp_ms=now_ms)
+        paused_after = self.risk_manager.is_paused
 
         incident_id: Optional[int] = None
 
@@ -379,6 +384,21 @@ class Executor:
                 await session.flush()
                 incident_id = inc.id
 
+        await self._send_incident_alert(
+            triangle_id=triangle_id,
+            failed_leg_index=failed_leg_index,
+            failed_symbol=failed_symbol,
+            liquidation_symbol=liquidation_symbol,
+            liquidation_pnl_usdt=liquidation_pnl_usdt,
+            incident_id=incident_id,
+        )
+
+        if (not paused_before) and paused_after and self.risk_manager.pause_reason:
+            await self._safe_alert(
+                "Circuit breaker tripped after reconciliation incidents. "
+                f"reason={self.risk_manager.pause_reason}"
+            )
+
         duration_ms = (time.time_ns() - start_ns) // 1_000_000
 
         return ExecutionResult(
@@ -391,6 +411,49 @@ class Executor:
             error_message=error_msg,
             incident_id=incident_id,
         )
+
+    async def _send_incident_alert(
+        self,
+        triangle_id: str,
+        failed_leg_index: int,
+        failed_symbol: str,
+        liquidation_symbol: str,
+        liquidation_pnl_usdt: Decimal,
+        incident_id: Optional[int],
+    ) -> None:
+        """Format and dispatch reconciliation incident alerts.
+
+        Args:
+            triangle_id: Execution identifier.
+            failed_leg_index: Failed leg index in execution order.
+            failed_symbol: Failed pair symbol.
+            liquidation_symbol: Emergency liquidation symbol.
+            liquidation_pnl_usdt: Estimated or realized reconciliation PnL.
+            incident_id: Optional persisted incident row id.
+        """
+        msg = (
+            "Reconciliation incident recorded. "
+            f"triangle_id={triangle_id} "
+            f"incident_id={incident_id} "
+            f"failed_leg={failed_leg_index} "
+            f"failed_symbol={failed_symbol} "
+            f"liquidation_symbol={liquidation_symbol} "
+            f"liquidation_pnl_usdt={liquidation_pnl_usdt}"
+        )
+        await self._safe_alert(msg)
+
+    async def _safe_alert(self, message: str) -> None:
+        """Send an alert message without allowing send failures to bubble.
+
+        Args:
+            message: Alert body.
+        """
+        if self.incident_alert_sender is None:
+            return
+        try:
+            await self.incident_alert_sender(message)
+        except Exception as exc:
+            logger.error("incident_alert_send_failed err='{}'", exc)
 
     async def _persist_trade(self, result: ExecutionResult, path_str: str) -> None:
         """Persist completed or failed ExecutionResult to SQLite database."""

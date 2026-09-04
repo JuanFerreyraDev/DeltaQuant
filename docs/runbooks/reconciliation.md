@@ -8,9 +8,8 @@ However, if Leg 0 fills but Leg 1 or Leg 2 fails (e.g. due to top-of-book price 
 
 This runbook documents:
 1. The **automated reconciliation mechanism** built into `core/executor.py`.
-2. The **operator investigation protocol** when an incident occurs or the `RiskManager` circuit breaker self-pauses trading.
-
-> **Phase 3 scope note**: The monitoring path in this phase is **manual** — no Telegram bot or `/status`/`/resume` commands exist yet (those are Phase 4). Discovery of a paused bot and manual resume both happen through direct Python shell interaction or by reading the SQLite incident log, as described below.
+2. The **Telegram incident alerting and control workflow** introduced in Phase 4.
+3. The **operator investigation protocol** when an incident occurs or the `RiskManager` circuit breaker self-pauses trading.
 
 ---
 
@@ -42,27 +41,29 @@ When a partial leg failure is detected in `core/executor.py`:
    - `liquidation_amount`
    - `liquidation_pnl_usdt`
    - `timestamp_ms`
-4. **Circuit Breaker**: `RiskManager.record_incident()` receives the incident timestamp. If **3 incidents occur within a rolling 60-minute window**, `RiskManager` automatically sets `is_paused = True` and logs `"Circuit breaker triggered"`. No automated alert is sent in Phase 3; the operator must discover this through the monitoring steps below.
+4. **Circuit Breaker**: `RiskManager.record_incident()` receives the incident timestamp. If **3 incidents occur within a rolling 60-minute window**, `RiskManager` automatically sets `is_paused = True` and logs `"Circuit breaker triggered"`.
+5. **Telegram alerts (Phase 4+)**:
+   - Every reconciliation incident emits a Telegram alert with triangle id, failed leg, symbols, and liquidation PnL.
+   - Circuit breaker transitions emit an additional high-priority Telegram alert.
 
 ---
 
-## 3. Operator Incident Investigation Protocol (Phase 3 — Manual)
+## 3. Operator Incident Investigation Protocol (Phase 4+)
 
-In Phase 3 there is no Telegram bot. To detect a paused bot or investigate incidents, use the methods below directly.
+Telegram is now part of the control-plane. Use Telegram first, then logs/SQLite for deep inspection.
 
 ### Step 1: Detect pause state
 
-Check the bot's log output for `risk_manager_paused` log lines:
+Check Telegram for incident and circuit-breaker alerts first, then verify pause state:
+
+```text
+/status
+```
+
+Or inspect logs for `risk_manager_paused` lines:
 
 ```bash
 grep -i "risk_manager_paused\|circuit_breaker\|executor_reconciliation" logs/deltaquant.log | tail -20
-```
-
-Or query the in-process `RiskManager` state in a Python shell (if the bot supports a control socket in Phase 4+):
-
-```python
-print(risk_manager.is_paused)
-print(risk_manager.pause_reason)
 ```
 
 ### Step 2: Query SQLite Incident Log
@@ -111,18 +112,23 @@ Common causes:
 Once the account balance is verified clean and the root cause addressed:
 
 1. Fix the underlying issue (e.g., reduce `MAX_POSITION_USDT` in `.env`, wait for network recovery).
-2. Resume trading by calling `risk_manager.resume()` directly in a Python shell:
+2. Resume trading through Telegram:
 
-```python
-# In a Python REPL attached to the running process, or after restart:
-risk_manager.resume()
-print(risk_manager.is_paused)   # → False
-print(risk_manager.pause_reason) # → None
+```text
+/resume
 ```
 
-> **Note**: Calling `risk_manager.resume()` clears the incident window history (`_incident_timestamps_ms`). This resets the circuit breaker counter to zero so that subsequent trades within the 60-minute window will not re-pause the bot without new incidents occurring.
+3. Confirm state with:
 
-> **Note**: In Phase 4, this resume step will be replaced by the Telegram `/resume` command. Until then, direct Python shell access is required.
+```text
+/status
+```
+
+Expected confirmation:
+- `is_paused=False`
+- `pause_reason=None`
+
+`/resume` maps to the existing `RiskManager.resume()` state transition, which clears the incident window history so the breaker does not immediately re-trigger without new incidents.
 
 ---
 
