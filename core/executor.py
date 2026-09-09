@@ -292,89 +292,48 @@ class Executor:
         path: Optional[tuple[str, str, str, str]] = None,
         tickers: Optional[Mapping[str, BookTicker]] = None,
     ) -> ExecutionResult:  # pragma: no cover — rehearsed in Phase 5
-        """Execute the 3 live legs in parallel and reconcile on failure."""
+        """Execute the 3 live legs sequentially and reconcile on failure (ADR-009)."""
         if path is None or tickers is None:
             raise ValueError("Live execution requires both the chosen path and the current ticker snapshot")
 
-        order_plan = self._build_live_order_plan(
-            path=path,
-            pair_symbols=pair_symbols,
+        # ── Step 1: Leg 0 Execution ───────────────────────────────────────────
+        # Leg 0 is sized from initial position_usdt
+        leg0_plan = self._build_single_leg_plan(
+            pair_symbol=pair_symbols[0],
+            asset_x=path[0],
+            asset_y=path[1],
+            amount_in=position_usdt,
             tickers=tickers,
-            position_usdt=position_usdt,
         )
 
-        order_results_raw = await asyncio.gather(
-            *[
-                self.adapter.place_fok_order(
-                    symbol=plan["symbol"],
-                    side=plan["side"],
-                    quantity=plan["quantity"],
-                    price=plan["price"],
-                )
-                for plan in order_plan
-            ],
-            return_exceptions=True,
-        )
+        try:
+            res0 = await self.adapter.place_fok_order(
+                symbol=str(leg0_plan["symbol"]),
+                side=str(leg0_plan["side"]),
+                quantity=Decimal(str(leg0_plan["quantity"])),
+                price=Decimal(str(leg0_plan["price"])),
+            )
+        except Exception as exc:
+            logger.error("live_order_failed triangle_id='{}' leg=0 err='{}'", triangle_id, exc)
+            res0 = OrderResult(
+                symbol=str(leg0_plan["symbol"]),
+                order_id="",
+                status="ERROR",
+                filled_qty=Decimal("0"),
+                avg_price=Decimal("0"),
+                fee=Decimal("0"),
+                fee_asset="",
+                raw={"exception": str(exc)},
+            )
 
-        order_results: list[OrderResult] = []
-        for idx, result in enumerate(order_results_raw):
-            if isinstance(result, Exception):
-                logger.error(
-                    "live_order_failed triangle_id='{}' leg={} err='{}'",
-                    triangle_id,
-                    idx,
-                    result,
-                )
-                order_results.append(
-                    OrderResult(
-                        symbol=str(order_plan[idx]["symbol"]),
-                        order_id="",
-                        status="ERROR",
-                        filled_qty=Decimal("0"),
-                        avg_price=Decimal("0"),
-                        fee=Decimal("0"),
-                        fee_asset="",
-                        raw={"exception": str(result)},
-                    )
-                )
-            else:
-                order_results.append(result)
-
-        if all(result.is_filled for result in order_results):
+        if not res0.is_filled:
             duration_ms = (time.time_ns() - start_ns) // 1_000_000
             logger.info(
-                "executor_live_success triangle_id='{}' net_return={} duration_ms={}",
+                "executor_live_leg0_expired triangle_id='{}' status='{}' duration_ms={}",
                 triangle_id,
-                expected_net_return,
+                res0.status,
                 duration_ms,
             )
-            return ExecutionResult(
-                triangle_id=triangle_id,
-                status="COMPLETED",
-                expected_net_return=expected_net_return,
-                actual_net_return=expected_net_return,
-                execution_duration_ms=duration_ms,
-                legs_filled=3,
-            )
-
-        if not order_results[0].is_filled:
-            if any(result.is_filled for result in order_results[1:]):
-                logger.error(
-                    "executor_live_unexpected_fill_without_leg0 triangle_id='{}'",
-                    triangle_id,
-                )
-                duration_ms = (time.time_ns() - start_ns) // 1_000_000
-                return ExecutionResult(
-                    triangle_id=triangle_id,
-                    status="FAILED_UNHANDLED",
-                    expected_net_return=expected_net_return,
-                    actual_net_return=Decimal("0"),
-                    execution_duration_ms=duration_ms,
-                    legs_filled=sum(1 for result in order_results if result.is_filled),
-                    error_message="Unexpected fill combination after Leg 0 failure",
-                )
-
-            duration_ms = (time.time_ns() - start_ns) // 1_000_000
             return ExecutionResult(
                 triangle_id=triangle_id,
                 status="FAILED_LEG_0",
@@ -382,10 +341,46 @@ class Executor:
                 actual_net_return=Decimal("1.0"),
                 execution_duration_ms=duration_ms,
                 legs_filled=0,
-                error_message=f"Live Leg 0 ({pair_symbols[0]}) FOK expiration",
+                error_message=f"Live Leg 0 ({pair_symbols[0]}) FOK expiration (0 legs filled, zero unhedged inventory)",
             )
 
-        if not order_results[1].is_filled:
+        # ── Step 2: Leg 1 Execution ───────────────────────────────────────────
+        # Leg 1 is sized using the REAL confirmed output from Leg 0 (ADR-009)
+        # If Leg 0 fee was deducted in the received asset, net it out
+        leg0_net_output = res0.filled_qty
+        if res0.fee_asset == path[1] and res0.fee > Decimal("0"):
+            leg0_net_output = max(Decimal("0"), leg0_net_output - res0.fee)
+
+        leg1_plan = self._build_single_leg_plan(
+            pair_symbol=pair_symbols[1],
+            asset_x=path[1],
+            asset_y=path[2],
+            amount_in=leg0_net_output,
+            tickers=tickers,
+        )
+
+        try:
+            res1 = await self.adapter.place_fok_order(
+                symbol=str(leg1_plan["symbol"]),
+                side=str(leg1_plan["side"]),
+                quantity=Decimal(str(leg1_plan["quantity"])),
+                price=Decimal(str(leg1_plan["price"])),
+            )
+        except Exception as exc:
+            logger.error("live_order_failed triangle_id='{}' leg=1 err='{}'", triangle_id, exc)
+            res1 = OrderResult(
+                symbol=str(leg1_plan["symbol"]),
+                order_id="",
+                status="ERROR",
+                filled_qty=Decimal("0"),
+                avg_price=Decimal("0"),
+                fee=Decimal("0"),
+                fee_asset="",
+                raw={"exception": str(exc)},
+            )
+
+        if not res1.is_filled:
+            # Leg 0 filled, Leg 1 failed → Reconcile Leg 0's actual held inventory
             return await self._reconcile_inventory(
                 pair_symbols=pair_symbols,
                 failed_leg_index=1,
@@ -397,13 +392,48 @@ class Executor:
                     f"Live Leg 1 ({pair_symbols[1]}) FOK expiration "
                     f"(Leg 0 filled, Leg 1 failed)"
                 ),
-                order_plan=order_plan,
-                order_results=order_results,
+                order_plan=[leg0_plan, leg1_plan],
+                order_results=[res0, res1],
                 path=path,
                 tickers=tickers,
             )
 
-        if not order_results[2].is_filled:
+        # ── Step 3: Leg 2 Execution ───────────────────────────────────────────
+        # Leg 2 is sized using the REAL confirmed output from Leg 1 (ADR-009)
+        leg1_net_output = res1.filled_qty
+        if res1.fee_asset == path[2] and res1.fee > Decimal("0"):
+            leg1_net_output = max(Decimal("0"), leg1_net_output - res1.fee)
+
+        leg2_plan = self._build_single_leg_plan(
+            pair_symbol=pair_symbols[2],
+            asset_x=path[2],
+            asset_y=path[3],
+            amount_in=leg1_net_output,
+            tickers=tickers,
+        )
+
+        try:
+            res2 = await self.adapter.place_fok_order(
+                symbol=str(leg2_plan["symbol"]),
+                side=str(leg2_plan["side"]),
+                quantity=Decimal(str(leg2_plan["quantity"])),
+                price=Decimal(str(leg2_plan["price"])),
+            )
+        except Exception as exc:
+            logger.error("live_order_failed triangle_id='{}' leg=2 err='{}'", triangle_id, exc)
+            res2 = OrderResult(
+                symbol=str(leg2_plan["symbol"]),
+                order_id="",
+                status="ERROR",
+                filled_qty=Decimal("0"),
+                avg_price=Decimal("0"),
+                fee=Decimal("0"),
+                fee_asset="",
+                raw={"exception": str(exc)},
+            )
+
+        if not res2.is_filled:
+            # Legs 0 and 1 filled, Leg 2 failed → Reconcile Leg 1's actual held inventory
             return await self._reconcile_inventory(
                 pair_symbols=pair_symbols,
                 failed_leg_index=2,
@@ -415,22 +445,73 @@ class Executor:
                     f"Live Leg 2 ({pair_symbols[2]}) FOK expiration "
                     f"(Legs 0 and 1 filled, Leg 2 failed)"
                 ),
-                order_plan=order_plan,
-                order_results=order_results,
+                order_plan=[leg0_plan, leg1_plan, leg2_plan],
+                order_results=[res0, res1, res2],
                 path=path,
                 tickers=tickers,
             )
 
+        # ── All 3 legs filled successfully ────────────────────────────────────
         duration_ms = (time.time_ns() - start_ns) // 1_000_000
+        # Calculate actual net return from real fills: USDT returned / initial position_usdt
+        # Leg 2 returns quote asset of Leg 2 (which is USDT at path[3])
+        usdt_received = res2.filled_qty * res2.avg_price
+        if res2.fee_asset == "USDT" and res2.fee > Decimal("0"):
+            usdt_received -= res2.fee
+        actual_net_return = usdt_received / position_usdt if position_usdt > Decimal("0") else expected_net_return
+
+        logger.info(
+            "executor_live_success triangle_id='{}' net_return={} duration_ms={}",
+            triangle_id,
+            actual_net_return,
+            duration_ms,
+        )
         return ExecutionResult(
             triangle_id=triangle_id,
-            status="FAILED_UNHANDLED",
+            status="COMPLETED",
             expected_net_return=expected_net_return,
-            actual_net_return=Decimal("0"),
+            actual_net_return=actual_net_return,
             execution_duration_ms=duration_ms,
-            legs_filled=sum(1 for result in order_results if result.is_filled),
-            error_message="Unexpected live execution state",
+            legs_filled=3,
         )
+
+    def _build_single_leg_plan(
+        self,
+        pair_symbol: str,
+        asset_x: str,
+        asset_y: str,
+        amount_in: Decimal,
+        tickers: Mapping[str, BookTicker],
+    ) -> dict[str, Decimal | str]:
+        """Build an order request for a single leg from current book and input amount."""
+        if pair_symbol not in tickers:
+            raise ValueError(f"Missing ticker for live execution symbol {pair_symbol!r}")
+
+        ticker = tickers[pair_symbol]
+        parsed = parse_symbol(pair_symbol)
+        if parsed is None:
+            raise ValueError(f"Could not parse live execution symbol {pair_symbol!r}")
+        base, quote = parsed
+
+        if asset_x == quote and asset_y == base:
+            side = "BUY"
+            price = ticker.ask
+            quantity = amount_in / price
+        elif asset_x == base and asset_y == quote:
+            side = "SELL"
+            price = ticker.bid
+            quantity = amount_in
+        else:
+            raise ValueError(
+                f"Pair {pair_symbol} does not connect live path leg {asset_x}->{asset_y}"
+            )
+
+        return {
+            "symbol": pair_symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+        }
 
     def _build_live_order_plan(
         self,
@@ -439,43 +520,24 @@ class Executor:
         tickers: Mapping[str, BookTicker],
         position_usdt: Decimal,
     ) -> list[dict[str, Decimal | str]]:
-        """Build the 3 live order requests from the evaluator path and tick snapshot."""
+        """Build theoretical order requests for all 3 legs (used in testing and dry-run)."""
         amount = position_usdt
         plan: list[dict[str, Decimal | str]] = []
 
         for pair_symbol, asset_x, asset_y in zip(pair_symbols, path[:-1], path[1:]):
-            if pair_symbol not in tickers:
-                raise ValueError(f"Missing ticker for live execution symbol {pair_symbol!r}")
-
-            ticker = tickers[pair_symbol]
-            parsed = parse_symbol(pair_symbol)
-            if parsed is None:
-                raise ValueError(f"Could not parse live execution symbol {pair_symbol!r}")
-            base, quote = parsed
-
-            if asset_x == quote and asset_y == base:
-                side = "BUY"
-                price = ticker.ask
-                quantity = amount / price
-                amount = quantity
-            elif asset_x == base and asset_y == quote:
-                side = "SELL"
-                price = ticker.bid
-                quantity = amount
-                amount = quantity * price
-            else:
-                raise ValueError(
-                    f"Pair {pair_symbol} does not connect live path leg {asset_x}->{asset_y}"
-                )
-
-            plan.append(
-                {
-                    "symbol": pair_symbol,
-                    "side": side,
-                    "quantity": quantity,
-                    "price": price,
-                }
+            leg_plan = self._build_single_leg_plan(
+                pair_symbol=pair_symbol,
+                asset_x=asset_x,
+                asset_y=asset_y,
+                amount_in=amount,
+                tickers=tickers,
             )
+            # Update running amount for next theoretical leg
+            if leg_plan["side"] == "BUY":
+                amount = Decimal(str(leg_plan["quantity"]))
+            else:
+                amount = Decimal(str(leg_plan["quantity"])) * Decimal(str(leg_plan["price"]))
+            plan.append(leg_plan)
 
         return plan
 

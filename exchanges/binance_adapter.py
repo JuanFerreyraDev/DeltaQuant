@@ -251,7 +251,10 @@ def _extract_order_fee(raw: dict) -> tuple[Decimal, str]:
     """Extract fee cost / asset from a ccxt order response."""
     fee = raw.get("fee") or {}
     if fee.get("cost") is not None:
-        return _decimal_or_none(fee.get("cost")) or Decimal("0"), str(fee.get("currency") or "")
+        parsed_cost = _decimal_or_none(fee.get("cost"))
+        if parsed_cost is None:
+            parsed_cost = Decimal("0")
+        return parsed_cost, str(fee.get("currency") or "")
 
     fees = raw.get("fees") or []
     if fees:
@@ -270,24 +273,45 @@ def _extract_order_fee(raw: dict) -> tuple[Decimal, str]:
 
 def _order_result_from_raw(symbol: str, raw: dict) -> OrderResult:
     """Convert a ccxt create_order payload into an OrderResult."""
-    filled_qty = (
-        _decimal_or_none(raw.get("filled"))
-        or _decimal_or_none(raw.get("executedQty"))
-        or _decimal_or_none(raw.get("amount"))
-        or Decimal("0")
-    )
+    info = raw.get("info") or {}
 
-    avg_price = (
-        _decimal_or_none(raw.get("average"))
-        or _decimal_or_none(raw.get("avgPrice"))
-        or _decimal_or_none(raw.get("price"))
-    )
-    if avg_price is None or avg_price <= Decimal("0"):
+    filled_qty: Optional[Decimal] = None
+    # Keep a defensive fallback chain but never treat Decimal('0') as "missing".
+    # 'amount' is last because many ccxt adapters set it to requested quantity.
+    for candidate in (
+        _decimal_or_none(raw.get("filled")),
+        _decimal_or_none(raw.get("executedQty")),
+        _decimal_or_none(info.get("executedQty")),
+        _decimal_or_none(raw.get("amount")),
+    ):
+        if candidate is not None:
+            filled_qty = candidate
+            break
+    if filled_qty is None:
+        filled_qty = Decimal("0")
+
+    avg_price: Optional[Decimal] = None
+    for candidate in (
+        _decimal_or_none(raw.get("average")),
+        _decimal_or_none(raw.get("avgPrice")),
+        _decimal_or_none(info.get("avgPrice")),
+    ):
+        if candidate is not None:
+            avg_price = candidate
+            break
+
+    if avg_price is None and filled_qty > Decimal("0"):
+        limit_or_exec_price = _decimal_or_none(raw.get("price"))
+        if limit_or_exec_price is not None:
+            avg_price = limit_or_exec_price
+
+    if avg_price is None and filled_qty > Decimal("0"):
         cost = _decimal_or_none(raw.get("cost"))
-        if cost is not None and filled_qty > Decimal("0"):
+        if cost is not None:
             avg_price = cost / filled_qty
-        else:
-            avg_price = Decimal("0")
+
+    if avg_price is None:
+        avg_price = Decimal("0")
 
     fee, fee_asset = _extract_order_fee(raw)
     status = _extract_order_status(raw, filled_qty)

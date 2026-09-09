@@ -10,12 +10,13 @@ These tests are designed to fail against plausible wrong implementations:
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from config.settings import Settings
-from exchanges.binance_adapter import BinanceAdapter
+from exchanges.binance_adapter import BinanceAdapter, _order_result_from_raw
 
 
 @pytest.fixture
@@ -97,11 +98,76 @@ def adapter(testnet_settings, market_rules) -> BinanceAdapter:
 
 
 class TestBinanceAdapterLiveOrders:
+    def test_order_result_from_real_expired_fok_payload_maps_zero_fill(self):
+        """Regression: real Binance EXPIRED FOK payload must map to filled_qty=0.
+
+        This fixture uses the literal shape captured during Scenario 2:
+        info.executedQty="0.00000000", status=EXPIRED, and empty fills array.
+        """
+        raw = {
+            "info": {
+                "symbol": "BTCUSDT",
+                "orderId": 13281780,
+                "orderListId": -1,
+                "clientOrderId": "x-TKT5PX2F1dcf8bedb375da97083ab0",
+                "transactTime": 1788824513594,
+                "price": "78262.88000000",
+                "origQty": "0.00007000",
+                "executedQty": "0.00000000",
+                "origQuoteOrderQty": "0.00000000",
+                "cummulativeQuoteQty": "0.00000000",
+                "status": "EXPIRED",
+                "expiryReason": "UNFILLED_FOK_ORDER_EXPIRED",
+                "timeInForce": "FOK",
+                "type": "LIMIT",
+                "side": "BUY",
+                "workingTime": 1788824513594,
+                "fills": [],
+                "selfTradePreventionMode": "EXPIRE_MAKER",
+            },
+            "id": "13281780",
+            "clientOrderId": "x-TKT5PX2F1dcf8bedb375da97083ab0",
+            "timestamp": 1788824513594,
+            "datetime": "2026-09-07T23:41:53.594Z",
+            "lastTradeTimestamp": None,
+            "lastUpdateTimestamp": 1788824513594,
+            "symbol": "BTC/USDT",
+            "type": "limit",
+            "timeInForce": "FOK",
+            "postOnly": False,
+            "reduceOnly": None,
+            "side": "buy",
+            "price": 78262.88,
+            "triggerPrice": None,
+            "amount": 7e-05,
+            "cost": 0.0,
+            "average": None,
+            "filled": 0.0,
+            "remaining": 7e-05,
+            "status": "expired",
+            "fee": None,
+            "trades": [],
+            "fees": [],
+            "stopPrice": None,
+            "takeProfitPrice": None,
+            "stopLossPrice": None,
+        }
+
+        result = _order_result_from_raw("BTCUSDT", raw)
+
+        assert result.status == "EXPIRED"
+        assert result.filled_qty == Decimal("0")
+        assert result.is_filled is False
+        assert result.avg_price == Decimal("0")
+
     @pytest.mark.asyncio
     async def test_place_fok_order_rejects_when_testnet_disabled(self, market_rules):
         settings = Settings(
             BINANCE_API_KEY="real_key_abc123",
             BINANCE_API_SECRET="real_secret_xyz789",
+            BINANCE_TESTNET=True,
+            TESTNET_BINANCE_API_KEY="testnet_key_abc123",
+            TESTNET_BINANCE_API_SECRET="testnet_secret_xyz789",
             TELEGRAM_BOT_TOKEN="111:AAA",
             TELEGRAM_CHAT_ID="123",
             DRY_RUN=False,
@@ -112,6 +178,7 @@ class TestBinanceAdapterLiveOrders:
         client.markets = market_rules
         client.load_markets = MagicMock(return_value=market_rules)
         adapter = BinanceAdapter(client, settings)
+        adapter._settings = SimpleNamespace(DRY_RUN=False, BINANCE_TESTNET=False)
         adapter._markets_cache = market_rules
 
         with pytest.raises(PermissionError):
@@ -160,6 +227,9 @@ class TestBinanceAdapterLiveOrders:
         settings = Settings(
             BINANCE_API_KEY="real_key_abc123",
             BINANCE_API_SECRET="real_secret_xyz789",
+            BINANCE_TESTNET=True,
+            TESTNET_BINANCE_API_KEY="testnet_key_abc123",
+            TESTNET_BINANCE_API_SECRET="testnet_secret_xyz789",
             TELEGRAM_BOT_TOKEN="111:AAA",
             TELEGRAM_CHAT_ID="123",
             DRY_RUN=False,
@@ -170,6 +240,7 @@ class TestBinanceAdapterLiveOrders:
         client.markets = market_rules
         client.load_markets = MagicMock(return_value=market_rules)
         adapter = BinanceAdapter(client, settings)
+        adapter._settings = SimpleNamespace(DRY_RUN=False, BINANCE_TESTNET=False)
         adapter._markets_cache = market_rules
 
         with pytest.raises(PermissionError):

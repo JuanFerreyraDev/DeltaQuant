@@ -27,6 +27,7 @@ _VALID_BASE = {
     "BINANCE_API_SECRET": "real_api_secret_xyz789",
     "TELEGRAM_BOT_TOKEN": "123456:ABCdef",
     "TELEGRAM_CHAT_ID": "987654321",
+    "_env_file": None,
 }
 
 

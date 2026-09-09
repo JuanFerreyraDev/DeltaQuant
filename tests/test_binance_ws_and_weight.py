@@ -152,6 +152,7 @@ class TestSubscribeBookTicker:
             BINANCE_API_SECRET="real_secret_xyz789",
             TELEGRAM_BOT_TOKEN="111:AAA",
             TELEGRAM_CHAT_ID="123",
+            _env_file=None,
         )
         return BinanceAdapter(rest_client, settings, ws_client=MagicMock())
 
