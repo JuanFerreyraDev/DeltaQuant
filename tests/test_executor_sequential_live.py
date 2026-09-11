@@ -270,3 +270,187 @@ async def test_sequential_leg2_expired_reconciles_real_leg1_fill(executor, trian
     assert recon_call_kwargs["side"] == "SELL"
     # MUST match real fill of 0.035, NOT theoretical 0.040
     assert recon_call_kwargs["quantity"] == real_leg1_fill
+
+
+@pytest.mark.asyncio
+async def test_sequential_reconciliation_nets_fee_when_fee_in_produced_asset(
+    executor, triangle, mock_adapter
+):
+    """Reconciliation market order must net the fee when fee was charged in the produced asset.
+
+    Scenario: Leg 0 (BUY on BTCUSDT) produces BTC. Leg 0 fills 0.002 BTC, but pays a fee
+    of 0.000002 BTC (in BTC). Net available BTC in account is 0.001998 BTC.
+    Leg 1 expires.
+    Reconciliation must liquidate Leg 0's held BTC via a market SELL order sized at
+    filled_qty - fee (0.001998 BTC), NOT filled_qty (0.002 BTC), preventing InsufficientFunds.
+    """
+    pair_symbols = ("BTCUSDT", "ETH/BTC", "ETHUSDT")
+    position_usdt = Decimal("100")
+    expected_return = Decimal("1.02")
+    path, tickers = make_test_path_and_tickers()
+
+    leg0_fill = Decimal("0.002")
+    leg0_fee = Decimal("0.000002")
+    expected_liquidation_qty = leg0_fill - leg0_fee  # 0.001998 BTC
+
+    res0 = make_order_result(
+        True,
+        pair_symbols[0],
+        filled_qty=leg0_fill,
+        avg_price=Decimal("50000"),
+        fee=leg0_fee,
+        fee_asset="BTC",
+    )
+    res1 = make_order_result(False, pair_symbols[1])
+
+    mock_adapter.place_fok_order = AsyncMock(side_effect=[res0, res1])
+    recon_res = make_order_result(
+        True,
+        pair_symbols[0],
+        filled_qty=expected_liquidation_qty,
+        avg_price=Decimal("49900"),
+    )
+    mock_adapter.place_market_order = AsyncMock(return_value=recon_res)
+
+    result = await executor.execute_triangle(
+        triangle=triangle,
+        pair_symbols=pair_symbols,
+        position_usdt=position_usdt,
+        expected_net_return=expected_return,
+        path=path,
+        tickers=tickers,
+    )
+
+    assert result.status == "FAILED_RECONCILED"
+    assert result.legs_filled == 1
+    mock_adapter.place_market_order.assert_called_once()
+    recon_call_kwargs = mock_adapter.place_market_order.call_args.kwargs
+    assert recon_call_kwargs["symbol"] == pair_symbols[0]
+    assert recon_call_kwargs["side"] == "SELL"
+    # Assert quantity is filled_qty MINUS fee, not filled_qty alone
+    assert recon_call_kwargs["quantity"] == expected_liquidation_qty
+    assert recon_call_kwargs["quantity"] != leg0_fill
+
+
+@pytest.mark.asyncio
+async def test_sequential_reconciliation_does_not_net_when_bnb_fee_discount_active(
+    executor, triangle, mock_adapter
+):
+    """When BNB fee discount is active, fee is charged in BNB, NOT the produced asset (BTC).
+
+    Scenario: Leg 0 (BUY on BTCUSDT) fills 0.002 BTC. Fee is 0.00015 BNB.
+    Because the fee was debited from BNB balance, the full 0.002 BTC was credited to the account.
+    Reconciliation must liquidate the full 0.002 BTC, without improperly subtracting BNB from BTC.
+    """
+    pair_symbols = ("BTCUSDT", "ETH/BTC", "ETHUSDT")
+    position_usdt = Decimal("100")
+    expected_return = Decimal("1.02")
+    path, tickers = make_test_path_and_tickers()
+
+    leg0_fill = Decimal("0.002")
+    bnb_fee = Decimal("0.00015")
+
+    res0 = make_order_result(
+        True,
+        pair_symbols[0],
+        filled_qty=leg0_fill,
+        avg_price=Decimal("50000"),
+        fee=bnb_fee,
+        fee_asset="BNB",
+    )
+    res1 = make_order_result(False, pair_symbols[1])
+
+    mock_adapter.place_fok_order = AsyncMock(side_effect=[res0, res1])
+    recon_res = make_order_result(
+        True,
+        pair_symbols[0],
+        filled_qty=leg0_fill,
+        avg_price=Decimal("49900"),
+    )
+    mock_adapter.place_market_order = AsyncMock(return_value=recon_res)
+
+    result = await executor.execute_triangle(
+        triangle=triangle,
+        pair_symbols=pair_symbols,
+        position_usdt=position_usdt,
+        expected_net_return=expected_return,
+        path=path,
+        tickers=tickers,
+    )
+
+    assert result.status == "FAILED_RECONCILED"
+    assert result.legs_filled == 1
+    mock_adapter.place_market_order.assert_called_once()
+    recon_call_kwargs = mock_adapter.place_market_order.call_args.kwargs
+    assert recon_call_kwargs["symbol"] == pair_symbols[0]
+    assert recon_call_kwargs["side"] == "SELL"
+    # Sized at full 0.002 BTC — BNB fee must NOT be subtracted from BTC quantity
+    assert recon_call_kwargs["quantity"] == leg0_fill
+
+
+@pytest.mark.asyncio
+async def test_sequential_reconciliation_nets_fee_in_buy_branch(
+    executor, triangle, mock_adapter
+):
+    """Reconciliation market order in BUY branch must net fee from quote_received.
+
+    Scenario: Path ETH -> USDT -> BTC -> ETH.
+    Leg 0: SELL ETH on ETHUSDT (bid 3000). Produces USDT.
+    Leg 0 sells 0.04 ETH at avg_price 3000 = 120 USDT gross.
+    Fee charged is 0.12 USDT in fee_asset='USDT'.
+    Net USDT held is 120 - 0.12 = 119.88 USDT.
+    Leg 1 (USDT -> BTC) fails.
+    Reconciliation reverses Leg 0 by BUYing back ETH on ETHUSDT at ask 3010.
+    Liquidation quantity must be 119.88 / 3010, NOT 120 / 3010.
+    """
+    path = ("ETH", "USDT", "BTC", "ETH")
+    pair_symbols = ("ETHUSDT", "BTCUSDT", "ETH/BTC")
+    tickers = {
+        "ETHUSDT": make_ticker(Decimal("3000"), Decimal("3010"), "ETHUSDT"),
+        "BTCUSDT": make_ticker(Decimal("49900"), Decimal("50000"), "BTCUSDT"),
+        "ETH/BTC": make_ticker(Decimal("0.049"), Decimal("0.050"), "ETH/BTC"),
+    }
+    position_eth = Decimal("0.04")
+
+    gross_quote = Decimal("120")  # 0.04 * 3000
+    fee_usdt = Decimal("0.12")
+    net_quote = gross_quote - fee_usdt  # 119.88
+    ask_price = Decimal("3010")
+    expected_liquidation_qty = net_quote / ask_price
+
+    res0 = make_order_result(
+        True,
+        pair_symbols[0],
+        filled_qty=position_eth,
+        avg_price=Decimal("3000"),
+        fee=fee_usdt,
+        fee_asset="USDT",
+    )
+    res1 = make_order_result(False, pair_symbols[1])
+
+    mock_adapter.place_fok_order = AsyncMock(side_effect=[res0, res1])
+    recon_res = make_order_result(
+        True,
+        pair_symbols[0],
+        filled_qty=expected_liquidation_qty,
+        avg_price=ask_price,
+    )
+    mock_adapter.place_market_order = AsyncMock(return_value=recon_res)
+
+    result = await executor.execute_triangle(
+        triangle=triangle,
+        pair_symbols=pair_symbols,
+        position_usdt=gross_quote,
+        expected_net_return=Decimal("1.01"),
+        path=path,
+        tickers=tickers,
+    )
+
+    assert result.status == "FAILED_RECONCILED"
+    assert result.legs_filled == 1
+    mock_adapter.place_market_order.assert_called_once()
+    recon_call_kwargs = mock_adapter.place_market_order.call_args.kwargs
+    assert recon_call_kwargs["symbol"] == pair_symbols[0]
+    assert recon_call_kwargs["side"] == "BUY"
+    assert recon_call_kwargs["quantity"] == expected_liquidation_qty
+

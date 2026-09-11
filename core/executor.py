@@ -347,9 +347,7 @@ class Executor:
         # ── Step 2: Leg 1 Execution ───────────────────────────────────────────
         # Leg 1 is sized using the REAL confirmed output from Leg 0 (ADR-009)
         # If Leg 0 fee was deducted in the received asset, net it out
-        leg0_net_output = res0.filled_qty
-        if res0.fee_asset == path[1] and res0.fee > Decimal("0"):
-            leg0_net_output = max(Decimal("0"), leg0_net_output - res0.fee)
+        leg0_net_output = self._net_of_fee(res0, path[1])
 
         leg1_plan = self._build_single_leg_plan(
             pair_symbol=pair_symbols[1],
@@ -400,9 +398,7 @@ class Executor:
 
         # ── Step 3: Leg 2 Execution ───────────────────────────────────────────
         # Leg 2 is sized using the REAL confirmed output from Leg 1 (ADR-009)
-        leg1_net_output = res1.filled_qty
-        if res1.fee_asset == path[2] and res1.fee > Decimal("0"):
-            leg1_net_output = max(Decimal("0"), leg1_net_output - res1.fee)
+        leg1_net_output = self._net_of_fee(res1, path[2])
 
         leg2_plan = self._build_single_leg_plan(
             pair_symbol=pair_symbols[2],
@@ -455,9 +451,8 @@ class Executor:
         duration_ms = (time.time_ns() - start_ns) // 1_000_000
         # Calculate actual net return from real fills: USDT returned / initial position_usdt
         # Leg 2 returns quote asset of Leg 2 (which is USDT at path[3])
-        usdt_received = res2.filled_qty * res2.avg_price
-        if res2.fee_asset == "USDT" and res2.fee > Decimal("0"):
-            usdt_received -= res2.fee
+        gross_usdt = res2.filled_qty * res2.avg_price
+        usdt_received = self._net_of_fee(res2, "USDT", amount=gross_usdt)
         actual_net_return = usdt_received / position_usdt if position_usdt > Decimal("0") else expected_net_return
 
         logger.info(
@@ -540,6 +535,22 @@ class Executor:
             plan.append(leg_plan)
 
         return plan
+
+    @staticmethod
+    def _net_of_fee(
+        result: OrderResult,
+        asset: str,
+        amount: Optional[Decimal] = None,
+    ) -> Decimal:
+        """Net fee from amount (defaulting to result.filled_qty) if fee was charged in asset.
+
+        If the fee is charged in another asset (e.g. BNB discount when trading BTC/USDT),
+        no netting against `asset` is applied.
+        """
+        qty = result.filled_qty if amount is None else amount
+        if result.fee_asset == asset and result.fee > Decimal("0"):
+            return max(Decimal("0"), qty - result.fee)
+        return qty
 
     @staticmethod
     def _asset_to_usdt_rate(asset: str, tickers: Mapping[str, BookTicker]) -> Decimal:
@@ -660,13 +671,18 @@ class Executor:
             previous_side = str(previous_plan["side"])
             liquidation_side = "SELL" if previous_side == "BUY" else "BUY"
             liquidation_pair_ticker = tickers[liquidation_symbol]
+            held_asset = path[previous_index + 1]
 
             if liquidation_side == "SELL":
-                liquidation_quantity = previous_result.filled_qty
+                liquidation_quantity = self._net_of_fee(previous_result, held_asset)
             else:
-                quote_received = previous_result.filled_qty * (
-                    previous_result.avg_price if previous_result.avg_price > Decimal("0") else Decimal(str(previous_plan["price"]))
+                raw_quote_price = (
+                    previous_result.avg_price
+                    if previous_result.avg_price > Decimal("0")
+                    else Decimal(str(previous_plan["price"]))
                 )
+                gross_quote = previous_result.filled_qty * raw_quote_price
+                quote_received = self._net_of_fee(previous_result, held_asset, amount=gross_quote)
                 if liquidation_pair_ticker.ask <= Decimal("0"):
                     raise ValueError(f"Invalid ask price for liquidation symbol {liquidation_symbol!r}")
                 liquidation_quantity = quote_received / liquidation_pair_ticker.ask
